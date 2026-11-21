@@ -30,10 +30,14 @@ pub enum TokenCheck {
     /// A valid application token (e.g. an end-user or device token) that must
     /// not reach the operator API.
     NotOperator,
+    /// A valid application token with operator rights (e.g. a session of an
+    /// administrator who logged in with a password).
+    Operator,
 }
 
-/// Hook for applications that issue their own bearer tokens, so those
-/// tokens are refused on the operator API even when no operator token is set.
+/// Hook for applications that issue their own bearer tokens: those tokens
+/// are refused on the operator API (even when no operator token is set), or
+/// granted operator access.
 pub trait TokenAuthority: Send + Sync + 'static {
     fn check(&self, token: &str) -> TokenCheck;
 }
@@ -88,9 +92,14 @@ impl AppState {
         let open = self.token.is_none();
         match Self::presented_token(headers, uri) {
             Some(t) if self.operator_token() == Some(t.as_str()) => Some(true),
-            Some(t) if self.authority.as_ref().map(|a| a.check(&t)) == Some(TokenCheck::NotOperator) => Some(false),
-            _ if open => Some(true),
-            _ => None,
+            Some(t) => match self.authority.as_ref().map(|a| a.check(&t)) {
+                Some(TokenCheck::Operator) => Some(true),
+                Some(TokenCheck::NotOperator) => Some(false),
+                _ if open => Some(true),
+                _ => None,
+            },
+            None if open => Some(true),
+            None => None,
         }
     }
 }
