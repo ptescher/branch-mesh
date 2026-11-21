@@ -8,7 +8,13 @@ use tower::ServiceExt;
 struct AppTokens;
 impl TokenAuthority for AppTokens {
     fn check(&self, token: &str) -> TokenCheck {
-        if token.starts_with("app_") { TokenCheck::NotOperator } else { TokenCheck::Unknown }
+        if token.starts_with("app_admin") {
+            TokenCheck::Operator
+        } else if token.starts_with("app_") {
+            TokenCheck::NotOperator
+        } else {
+            TokenCheck::Unknown
+        }
     }
 }
 
@@ -35,4 +41,5 @@ async fn operator_api_rejects_application_tokens() {
     assert_eq!(status(&locked, Some("wrong")).await, StatusCode::UNAUTHORIZED);
     assert_eq!(status(&locked, Some("app_user")).await, StatusCode::FORBIDDEN);
     assert_eq!(status(&locked, Some("secret")).await, StatusCode::OK);
+    assert_eq!(status(&locked, Some("app_admin_session")).await, StatusCode::OK, "authority grants operator");
 }

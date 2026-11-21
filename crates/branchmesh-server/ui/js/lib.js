@@ -13,6 +13,15 @@ export function getToken() { try { return localStorage.getItem(TOKEN_KEY) || '';
 function setToken(t) { try { localStorage.setItem(TOKEN_KEY, t); } catch { /* ignore */ } }
 
 export function setStoredToken(t) { setToken(t); }
+export function clearStoredToken() { try { localStorage.removeItem(TOKEN_KEY); } catch { /* ignore */ } }
+
+// Called when the API answers 401. Resolves to a new token (the request is
+// retried with it) or null. Extensions can replace it, e.g. with a login form.
+let unauthorizedHandler = async () => {
+  const t = prompt('This BranchMesh server requires an API token (BRANCHMESH_API_TOKEN):');
+  return t ? t.trim() : null;
+};
+export function setUnauthorizedHandler(fn) { unauthorizedHandler = fn; }
 
 export async function api(path, { method = 'GET', body, quiet = false, token: explicit, raw, contentType } = {}) {
   const headers = { 'content-type': contentType || 'application/json' };
@@ -21,8 +30,8 @@ export async function api(path, { method = 'GET', body, quiet = false, token: ex
   const payload = raw !== undefined ? raw : (body === undefined ? undefined : JSON.stringify(body));
   const res = await fetch(`/api${path}`, { method, headers, body: payload });
   if (res.status === 401 && explicit === undefined) {
-    const t = prompt('This BranchMesh server requires an API token (BRANCHMESH_API_TOKEN):');
-    if (t) { setToken(t.trim()); return api(path, { method, body, quiet, raw, contentType }); }
+    const t = await unauthorizedHandler();
+    if (t) { setToken(t); return api(path, { method, body, quiet, raw, contentType }); }
   }
   let data = null;
   const text = await res.text();
