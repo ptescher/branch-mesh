@@ -39,14 +39,28 @@ export function renderBlocks(blocks) {
   return out;
 }
 
-export function renderMessage(m) {
-  const who = m.role === 'assistant' ? (m.persona || 'agent') : (m.kind === 'tool_results' ? 'tool results' : (m.author || 'user'));
+/**
+ * Render a stored message. `names` maps author/persona ids to display names;
+ * `opts.systemLabel(m)` may return a custom heading for role:"system" records.
+ */
+export function renderMessage(m, names = {}, opts = {}) {
+  if (m.role === 'system') {
+    const label = opts.systemLabel?.(m)
+      || (m.kind === 'memory_snapshot' ? '🧠 Standing facts shown to the AI'
+        : `⚙ ${m.kind || 'system'}${m.author_name ? ` from ${m.author_name}` : ''} — shown to the AI`);
+    return h('div', { class: `msg system ${m.kind || ''}` },
+      h('div', { class: 'msg-head' }, h('span', { class: 'who' }, label), h('span', { class: 'muted small' }, fmtTime(m.ts))),
+      h('div', { class: 'msg-body' }, renderMarkdown(typeof m.content === 'string' ? m.content : JSON.stringify(m.content))));
+  }
+  const rawWho = m.role === 'assistant' ? (m.persona || 'agent') : (m.kind === 'tool_results' ? 'tool results' : (m.author || 'user'));
+  const who = names[rawWho] || rawWho;
   const side = m.role === 'assistant' || m.kind === 'tool_results' ? 'left' : 'right';
   const color = m.role === 'assistant' ? colorFor(m.persona) : undefined;
   const meta = [fmtTime(m.ts)];
   if (m.model) meta.push(m.model);
   if (m.stop_reason && m.stop_reason !== 'end_turn') meta.push(m.stop_reason);
-  if (m.role !== 'assistant' && m.persona && m.kind !== 'tool_results') meta.push(`→ ${m.persona}`);
+  if (m.role !== 'assistant' && m.persona && m.kind !== 'tool_results') meta.push(`→ ${names[m.persona] || m.persona}`);
+  if (m.modality) meta.push(m.modality);
   return h('div', { class: `msg ${side} ${m.kind === 'tool_results' ? 'tools' : ''} ${m.consult_of ? 'consult' : ''}` },
     h('div', { class: 'msg-head' }, h('span', { class: 'who', style: color ? { color } : {} }, who),
       m.consult_of ? badge(`consultation for ${m.consult_of}`, 'purple') : null,
@@ -158,7 +172,7 @@ export function mount(root, params) {
       transcript.append(h('details', { class: 'consult-group' },
         h('summary', {}, '⑂ ', h('b', {}, `${m.consult_of} consulted ${target}`), h('span', { class: 'muted small' }, ` · ${group.length} message(s) on `),
           h('a', { class: 'mono small', href: `#/chat?branch=${encodeURIComponent(m.branch)}` }, m.branch), h('span', { class: 'muted small' }, ' · merged')),
-        group.map(renderMessage)));
+        group.map((m) => renderMessage(m))));
     }
     for (const [exec, s] of streams) {
       transcript.append(h('div', { class: 'msg left streaming', 'data-exec': exec },

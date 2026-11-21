@@ -66,12 +66,32 @@ fn slug(s: &str) -> String {
 impl MockProvider {
     fn decide(&self, req: &LlmRequest) -> (Vec<Value>, &'static str) {
         let n = req.messages.len();
-        let last = req.messages.last().cloned().unwrap_or(json!({}));
+        let last = req.messages.iter().rev().find(|m| m["role"] != "system").cloned().unwrap_or(json!({}));
+        let note = req
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m["role"] == "system")
+            .and_then(|m| m["content"].as_str())
+            .map(|t| t.lines().last().unwrap_or("").trim().to_string());
 
         if req.output_schema.is_some() {
-            // Structured requests (e.g. semantic merge): return an empty
-            // result so callers fall back to their heuristics.
-            return (vec![json!({"type": "text", "text": "{\"resolutions\": []}"})], "end_turn");
+            // Structured requests: return an empty instance of the schema
+            // (arrays empty, strings blank) so callers use their fallbacks.
+            let mut obj = serde_json::Map::new();
+            if let Some(props) = req.output_schema.as_ref().and_then(|s| s["properties"].as_object()) {
+                for (k, v) in props {
+                    let empty = match v["type"].as_str() {
+                        Some("array") => json!([]),
+                        Some("object") => json!({}),
+                        Some("boolean") => json!(false),
+                        Some("number") | Some("integer") => json!(0),
+                        _ => json!(""),
+                    };
+                    obj.insert(k.clone(), empty);
+                }
+            }
+            return (vec![json!({"type": "text", "text": Value::Object(obj).to_string()})], "end_turn");
         }
 
         // Tool results came back: summarize them.
@@ -122,11 +142,22 @@ impl MockProvider {
         }
 
         let flavor = req.system.split(['.', '\n']).next().unwrap_or("").trim();
-        let text = if flavor.is_empty() {
-            format!("[mock] I received: \"{line}\". Set ANTHROPIC_API_KEY to talk to Claude.")
+        // Labeled messages (`[label]\ntext`, see ContextStyle) get a relay-style echo.
+        let label = user_text
+            .strip_prefix('[')
+            .and_then(|r| r.split_once("]\n"))
+            .map(|(l, _)| l)
+            .filter(|l| !l.contains('→') && !l.ends_with(" replied"));
+        let mut text = if let Some(label) = label {
+            format!("[mock] ({label}) {line}")
+        } else if flavor.is_empty() {
+            format!("[mock] I received: \"{line}\". Set an LLM API key to talk to a real model.")
         } else {
-            format!("[mock · {flavor}] I received: \"{line}\". Set ANTHROPIC_API_KEY to talk to Claude.")
+            format!("[mock · {flavor}] I received: \"{line}\". Set an LLM API key to talk to a real model.")
         };
+        if let Some(note) = note.filter(|n| !n.is_empty()) {
+            text.push_str(&format!(" (Keeping in mind: {note})"));
+        }
         (vec![json!({"type": "text", "text": text})], "end_turn")
     }
 }

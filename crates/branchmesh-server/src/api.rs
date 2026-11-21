@@ -21,22 +21,83 @@ use std::time::Instant;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
+/// What an application-level token store says about a bearer token that is
+/// not the operator token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenCheck {
+    /// Not one of the application's tokens.
+    Unknown,
+    /// A valid application token (e.g. an end-user or device token) that must
+    /// not reach the operator API.
+    NotOperator,
+}
+
+/// Hook for applications that issue their own bearer tokens, so those
+/// tokens are refused on the operator API even when no operator token is set.
+pub trait TokenAuthority: Send + Sync + 'static {
+    fn check(&self, token: &str) -> TokenCheck;
+}
+
 #[derive(Clone)]
 pub struct AppState {
     rt: Runtime,
     token: Option<Arc<String>>,
+    authority: Option<Arc<dyn TokenAuthority>>,
     started: Instant,
 }
 
 impl AppState {
     pub fn new(rt: Runtime, token: Option<String>) -> Self {
-        AppState { rt, token: token.filter(|t| !t.is_empty()).map(Arc::new), started: Instant::now() }
+        AppState { rt, token: token.filter(|t| !t.is_empty()).map(Arc::new), authority: None, started: Instant::now() }
+    }
+
+    pub fn with_authority(mut self, authority: Arc<dyn TokenAuthority>) -> Self {
+        self.authority = Some(authority);
+        self
+    }
+
+    pub fn runtime(&self) -> &Runtime {
+        &self.rt
+    }
+
+    /// The configured operator token, if any.
+    pub fn operator_token(&self) -> Option<&str> {
+        self.token.as_deref().map(|s| s.as_str())
+    }
+
+    /// Bearer token from the Authorization header or `?token=` (EventSource
+    /// cannot set headers).
+    pub fn presented_token(headers: &axum::http::HeaderMap, uri: &axum::http::Uri) -> Option<String> {
+        headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .map(|t| t.trim().to_string())
+            .or_else(|| {
+                uri.query().and_then(|q| {
+                    q.split('&').find_map(|kv| kv.strip_prefix("token=").map(|t| t.to_string()))
+                })
+            })
+            .filter(|t| !t.is_empty())
+    }
+
+    /// `Some(true)`: operator; `Some(false)`: authenticated, but not an
+    /// operator; `None`: unauthenticated. With no operator token configured,
+    /// any caller that is not a known application token is an operator.
+    pub fn operator_access(&self, headers: &axum::http::HeaderMap, uri: &axum::http::Uri) -> Option<bool> {
+        let open = self.token.is_none();
+        match Self::presented_token(headers, uri) {
+            Some(t) if self.operator_token() == Some(t.as_str()) => Some(true),
+            Some(t) if self.authority.as_ref().map(|a| a.check(&t)) == Some(TokenCheck::NotOperator) => Some(false),
+            _ if open => Some(true),
+            _ => None,
+        }
     }
 }
 
 // ------------------------------------------------------------------ errors
 
-pub struct ApiError(StatusCode, Value);
+pub struct ApiError(pub StatusCode, pub Value);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -67,14 +128,17 @@ impl From<serde_json::Error> for ApiError {
     }
 }
 
-fn bad(msg: impl std::fmt::Display) -> ApiError {
+pub fn bad(msg: impl std::fmt::Display) -> ApiError {
     ApiError(StatusCode::BAD_REQUEST, json!({ "error": msg.to_string() }))
 }
 
-type ApiResult = Result<Json<Value>, ApiError>;
+pub type ApiResult = Result<Json<Value>, ApiError>;
 
 // ------------------------------------------------------------------ router
 
+/// The operator API (`/api/...`) and `/api/health`, without a UI fallback.
+/// Applications can `merge` their own routes before adding
+/// [`crate::ui::static_handler`] (or their own) as the fallback.
 pub fn router(state: AppState) -> Router {
     let api = Router::new()
         .route("/stats", get(stats))
@@ -116,25 +180,12 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Operator endpoints.
 async fn auth(State(s): State<AppState>, req: Request, next: Next) -> Response {
-    let Some(token) = &s.token else { return next.run(req).await };
-    let header_ok = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|t| t == token.as_str())
-        .unwrap_or(false);
-    // EventSource cannot set headers, so also accept ?token=.
-    let query_ok = req
-        .uri()
-        .query()
-        .map(|q| q.split('&').any(|kv| kv.strip_prefix("token=").map(|t| t == token.as_str()).unwrap_or(false)))
-        .unwrap_or(false);
-    if header_ok || query_ok {
-        next.run(req).await
-    } else {
-        (StatusCode::UNAUTHORIZED, Json(json!({ "error": "missing or invalid bearer token" }))).into_response()
+    match s.operator_access(req.headers(), req.uri()) {
+        Some(true) => next.run(req).await,
+        Some(false) => (StatusCode::FORBIDDEN, Json(json!({ "error": "operator access required" }))).into_response(),
+        None => (StatusCode::UNAUTHORIZED, Json(json!({ "error": "missing or invalid bearer token" }))).into_response(),
     }
 }
 
@@ -153,6 +204,7 @@ async fn health(State(s): State<AppState>) -> Json<Value> {
         "ok": true,
         "version": env!("CARGO_PKG_VERSION"),
         "provider": s.rt.mesh().llm().name(),
+        "speech": { "stt": s.rt.speech().stt.name(), "tts": s.rt.speech().tts.name() },
         "uptime_s": s.started.elapsed().as_secs(),
         "auth": s.token.is_some(),
     }))

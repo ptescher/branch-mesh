@@ -1,5 +1,6 @@
 //! Claude provider over the Messages API (raw HTTP + SSE streaming; there is
-//! no official Rust SDK).
+//! no official Rust SDK). The same client talks to Anthropic directly or to
+//! OpenRouter's Anthropic-compatible `POST /api/v1/messages` endpoint.
 //!
 //! Request shape decisions:
 //! * `thinking: {type: "adaptive"}` on models that support it.
@@ -23,8 +24,19 @@ pub const API_VERSION: &str = "2026-10-21";
 const BETA_FALLBACK: &str = "server-side-fallback-2026-07-01";
 const BETA_BLOCK_BINDING: &str = "thinking-binding-controls-2026-08-01";
 
+/// Which Messages-API-compatible service to call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flavor {
+    /// api.anthropic.com
+    Anthropic,
+    /// openrouter.ai `/api/v1/messages` (bearer auth, `anthropic/...` model ids,
+    /// OpenRouter-routed `fallbacks: [{model}]`).
+    OpenRouter,
+}
+
 #[derive(Debug, Clone)]
 pub struct AnthropicConfig {
+    pub flavor: Flavor,
     pub api_key: Option<String>,
     pub auth_token: Option<String>,
     pub base_url: String,
@@ -34,21 +46,57 @@ pub struct AnthropicConfig {
     pub drop_invalid_thinking: bool,
     pub max_retries: u32,
     pub timeout: Duration,
+    /// OpenRouter only: explicit fallback models (None = per-model defaults,
+    /// empty = disabled).
+    pub fallback_models: Option<Vec<String>>,
+    /// OpenRouter only: app attribution (`HTTP-Referer`, `X-Title`).
+    pub app_url: Option<String>,
+    pub app_name: Option<String>,
+}
+
+fn env_flag(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .map(|v| !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"))
+        .unwrap_or(default)
 }
 
 impl AnthropicConfig {
+    /// OpenRouter configuration from `OPENROUTER_API_KEY` (+ optional
+    /// `OPENROUTER_BASE_URL`, `OPENROUTER_FALLBACK_MODELS`, `OPENROUTER_APP_URL`,
+    /// `OPENROUTER_APP_NAME`).
+    pub fn openrouter_from_env() -> Option<Self> {
+        let key = std::env::var("OPENROUTER_API_KEY").ok().filter(|s| !s.is_empty())?;
+        let fallback_models = std::env::var("OPENROUTER_FALLBACK_MODELS").ok().map(|v| {
+            if matches!(v.trim().to_ascii_lowercase().as_str(), "" | "off" | "none" | "false") {
+                vec![]
+            } else {
+                v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+            }
+        });
+        Some(AnthropicConfig {
+            flavor: Flavor::OpenRouter,
+            api_key: None,
+            auth_token: Some(key),
+            base_url: std::env::var("OPENROUTER_BASE_URL").unwrap_or_else(|_| "https://openrouter.ai/api".into()),
+            fallbacks: env_flag("BRANCHMESH_LLM_FALLBACKS", true),
+            drop_invalid_thinking: env_flag("BRANCHMESH_DROP_INVALID_THINKING", true),
+            max_retries: 3,
+            timeout: Duration::from_secs(600),
+            fallback_models,
+            app_url: std::env::var("OPENROUTER_APP_URL").ok(),
+            app_name: Some(std::env::var("OPENROUTER_APP_NAME").unwrap_or_else(|_| "BranchMesh".into())),
+        })
+    }
+
     pub fn from_env() -> Option<Self> {
         let api_key = std::env::var("ANTHROPIC_API_KEY").ok().filter(|s| !s.is_empty());
         let auth_token = std::env::var("ANTHROPIC_AUTH_TOKEN").ok().filter(|s| !s.is_empty());
         if api_key.is_none() && auth_token.is_none() {
             return None;
         }
-        let flag = |name: &str, default: bool| {
-            std::env::var(name)
-                .map(|v| !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"))
-                .unwrap_or(default)
-        };
+        let flag = env_flag;
         Some(AnthropicConfig {
+            flavor: Flavor::Anthropic,
             api_key,
             auth_token,
             base_url: std::env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| "https://api.anthropic.com".into()),
@@ -56,7 +104,48 @@ impl AnthropicConfig {
             drop_invalid_thinking: flag("BRANCHMESH_DROP_INVALID_THINKING", true),
             max_retries: 3,
             timeout: Duration::from_secs(600),
+            fallback_models: None,
+            app_url: None,
+            app_name: None,
         })
+    }
+}
+
+/// Normalize a model id to Anthropic's form: `anthropic/claude-opus-5.5` -> `claude-opus-5-5`.
+pub fn anthropic_model_id(model: &str) -> String {
+    model.strip_prefix("anthropic/").unwrap_or(model).replace('.', "-")
+}
+
+/// Map a model id to OpenRouter's form: `claude-opus-5-5` -> `anthropic/claude-opus-5.5`.
+/// Ids that already contain a `/` (any OpenRouter model) pass through unchanged.
+pub fn openrouter_model_id(model: &str) -> String {
+    if model.contains('/') {
+        return model.to_string();
+    }
+    let mut id = model.to_string();
+    // A trailing "-<major>-<minor>" version becomes "<major>.<minor>".
+    let parts: Vec<&str> = model.rsplitn(3, '-').collect();
+    if parts.len() == 3
+        && parts[0].chars().all(|c| c.is_ascii_digit())
+        && parts[1].chars().all(|c| c.is_ascii_digit())
+        && !parts[0].is_empty()
+        && !parts[1].is_empty()
+    {
+        id = format!("{}-{}.{}", parts[2], parts[1], parts[0]);
+    }
+    format!("anthropic/{id}")
+}
+
+/// Default OpenRouter fallback chain for a Claude model (mirrors Anthropic's
+/// recommended refusal fallbacks; OpenRouter has no `"default"` mode).
+fn openrouter_default_fallbacks(model: &str) -> Vec<String> {
+    let m = anthropic_model_id(model);
+    if m.starts_with("claude-opus-5-5") || m.starts_with("claude-fable-5") {
+        vec!["anthropic/claude-opus-5".into()]
+    } else if m.starts_with("claude-sonnet-5-5") {
+        vec!["anthropic/claude-sonnet-5".into()]
+    } else {
+        vec![]
     }
 }
 
@@ -66,6 +155,10 @@ pub struct AnthropicProvider {
 }
 
 fn supports_adaptive_thinking(model: &str) -> bool {
+    if model.contains('/') && !model.starts_with("anthropic/") {
+        return false;
+    }
+    let model = &anthropic_model_id(model);
     [
         "claude-opus-5", "claude-sonnet-5", "claude-haiku-5", "claude-fable", "claude-mythos",
         "claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8", "claude-sonnet-4-6",
@@ -75,6 +168,7 @@ fn supports_adaptive_thinking(model: &str) -> bool {
 }
 
 fn supports_server_fallback(model: &str) -> bool {
+    let model = &anthropic_model_id(model);
     ["claude-opus-5", "claude-fable-5", "claude-sonnet-5-5"]
         .iter()
         .any(|p| model.starts_with(p))
@@ -122,8 +216,12 @@ impl AnthropicProvider {
 
     fn build_body(&self, req: &LlmRequest) -> (Value, Vec<&'static str>) {
         let mut betas = Vec::new();
+        let model = match self.cfg.flavor {
+            Flavor::Anthropic => anthropic_model_id(&req.model),
+            Flavor::OpenRouter => openrouter_model_id(&req.model),
+        };
         let mut body = json!({
-            "model": req.model,
+            "model": model,
             "max_tokens": req.max_tokens,
             "messages": req.messages,
             "stream": true,
@@ -153,9 +251,30 @@ impl AnthropicProvider {
         if !output_config.is_empty() {
             body["output_config"] = Value::Object(output_config);
         }
-        if self.cfg.fallbacks && supports_server_fallback(&req.model) {
-            body["fallbacks"] = json!("default");
-            betas.push(BETA_FALLBACK);
+        if self.cfg.fallbacks {
+            match self.cfg.flavor {
+                Flavor::Anthropic if supports_server_fallback(&req.model) => {
+                    body["fallbacks"] = json!("default");
+                    betas.push(BETA_FALLBACK);
+                }
+                Flavor::OpenRouter => {
+                    let models = self
+                        .cfg
+                        .fallback_models
+                        .clone()
+                        .unwrap_or_else(|| openrouter_default_fallbacks(&req.model));
+                    let models: Vec<Value> = models
+                        .into_iter()
+                        .filter(|m| *m != model)
+                        .take(3)
+                        .map(|m| json!({ "model": m }))
+                        .collect();
+                    if !models.is_empty() {
+                        body["fallbacks"] = Value::Array(models);
+                    }
+                }
+                _ => {}
+            }
         }
         (body, betas)
     }
@@ -174,6 +293,12 @@ impl AnthropicProvider {
                 rb = rb.header("x-api-key", key);
             } else if let Some(token) = &self.cfg.auth_token {
                 rb = rb.bearer_auth(token);
+            }
+            if let Some(u) = &self.cfg.app_url {
+                rb = rb.header("HTTP-Referer", u);
+            }
+            if let Some(n) = &self.cfg.app_name {
+                rb = rb.header("X-Title", n);
             }
             if !betas.is_empty() {
                 rb = rb.header("anthropic-beta", betas.join(","));
@@ -205,13 +330,13 @@ impl AnthropicProvider {
                         tokio::time::sleep(delay).await;
                         continue;
                     }
-                    return Err(Error::Other(format!("anthropic API error {status}: {text}")));
+                    return Err(Error::Other(format!("{} API error {status}: {text}", self.name())));
                 }
                 Err(e) if attempt < self.cfg.max_retries && (e.is_connect() || e.is_timeout()) => {
                     attempt += 1;
                     tokio::time::sleep(Duration::from_millis(1000 * 2u64.pow(attempt - 1))).await;
                 }
-                Err(e) => return Err(Error::Other(format!("anthropic request failed: {e}"))),
+                Err(e) => return Err(Error::Other(format!("anthropic request failed: {}", branchmesh_core::error_chain(&e)))),
             }
         }
     }
@@ -319,7 +444,10 @@ impl StreamState {
 #[async_trait]
 impl LlmProvider for AnthropicProvider {
     fn name(&self) -> &str {
-        "anthropic"
+        match self.cfg.flavor {
+            Flavor::Anthropic => "anthropic",
+            Flavor::OpenRouter => "openrouter",
+        }
     }
 
     async fn complete(&self, req: &LlmRequest, on_delta: DeltaFn<'_>) -> Result<LlmResponse> {
@@ -356,7 +484,7 @@ impl LlmProvider for AnthropicProvider {
         Ok(LlmResponse {
             id: state.message["id"].as_str().unwrap_or("").to_string(),
             model: state.message["model"].as_str().unwrap_or(&req.model).to_string(),
-            provider: "anthropic".into(),
+            provider: self.name().into(),
             content: sanitize_fallback_content(content),
             stop_reason: state.stop_reason,
             stop_details: state.stop_details,
@@ -401,6 +529,10 @@ mod tests {
     #[test]
     fn request_body_shape() {
         let cfg = AnthropicConfig {
+            flavor: Flavor::Anthropic,
+            fallback_models: None,
+            app_url: None,
+            app_name: None,
             api_key: Some("k".into()),
             auth_token: None,
             base_url: "http://x".into(),
@@ -433,6 +565,46 @@ mod tests {
         let (body, betas) = p.build_body(&LlmRequest { model: "claude-haiku-5-5".into(), ..req });
         assert!(body.get("fallbacks").is_none());
         assert_eq!(betas, vec![BETA_BLOCK_BINDING]);
+    }
+
+    #[test]
+    fn openrouter_body_and_model_ids() {
+        assert_eq!(openrouter_model_id("claude-opus-5-5"), "anthropic/claude-opus-5.5");
+        assert_eq!(openrouter_model_id("claude-opus-5"), "anthropic/claude-opus-5");
+        assert_eq!(openrouter_model_id("claude-haiku-4-5"), "anthropic/claude-haiku-4.5");
+        assert_eq!(openrouter_model_id("google/gemini-3-flash"), "google/gemini-3-flash");
+        assert_eq!(anthropic_model_id("anthropic/claude-sonnet-5.5"), "claude-sonnet-5-5");
+
+        let p = AnthropicProvider::new(AnthropicConfig {
+            flavor: Flavor::OpenRouter,
+            api_key: None,
+            auth_token: Some("k".into()),
+            base_url: "http://x".into(),
+            fallbacks: true,
+            drop_invalid_thinking: true,
+            max_retries: 0,
+            timeout: Duration::from_secs(1),
+            fallback_models: None,
+            app_url: None,
+            app_name: Some("BranchMesh".into()),
+        });
+        let req = LlmRequest {
+            model: "claude-opus-5-5".into(),
+            messages: vec![json!({"role": "user", "content": "hi"})],
+            max_tokens: 100,
+            ..Default::default()
+        };
+        let (body, betas) = p.build_body(&req);
+        assert_eq!(body["model"], "anthropic/claude-opus-5.5");
+        assert_eq!(body["fallbacks"], json!([{"model": "anthropic/claude-opus-5"}]));
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(betas, vec![BETA_BLOCK_BINDING]);
+        assert_eq!(p.name(), "openrouter");
+
+        // Non-Claude models get no Claude-specific thinking config.
+        let (body, _) = p.build_body(&LlmRequest { model: "google/gemini-3-flash".into(), ..req });
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("fallbacks").is_none());
     }
 
     #[test]

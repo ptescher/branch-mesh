@@ -7,6 +7,8 @@ services:
     environment:
       # Without a key BranchMesh runs with an offline mock LLM.
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # Alternatively OpenRouter (also enables server-side speech):
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       # Strongly recommended when exposed beyond localhost.
       BRANCHMESH_API_TOKEN: ${BRANCHMESH_API_TOKEN:-}
       BRANCHMESH_DEFAULT_MODEL: ${BRANCHMESH_DEFAULT_MODEL:-claude-opus-5-5}

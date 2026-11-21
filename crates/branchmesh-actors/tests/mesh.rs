@@ -65,7 +65,7 @@ async fn message_roundtrip_and_memory_tool() {
     assert_eq!(reply.steps, 2);
     assert_eq!(mesh.repo().get("t", "memory/the-sky-is-blue").unwrap(), Some(json!("the sky is blue")));
 
-    let ctx = branchmesh_actors::agent::build_context(mesh.repo(), "t", "bot").unwrap();
+    let ctx = branchmesh_actors::agent::build_context(mesh.repo(), "t", "bot", "claude-opus-5-5").unwrap();
     // user, assistant, user, assistant(tool_use), user(tool_result), assistant
     assert_eq!(ctx.len(), 6);
     assert_eq!(ctx[4]["content"][0]["type"], "tool_result");
@@ -117,7 +117,7 @@ async fn consultation_forks_and_merges_back() {
     assert!(matches!(forks[0].status, branchmesh_core::BranchStatus::Merged { .. }));
 
     // The lead does not see the side conversation (its result is in the tool_result) ...
-    let lead_ctx = agent::build_context(mesh.repo(), "t", "lead").unwrap();
+    let lead_ctx = agent::build_context(mesh.repo(), "t", "lead", "claude-opus-5-5").unwrap();
     let text = serde_json::to_string(&lead_ctx).unwrap();
     assert!(!text.contains("[message from agent:lead]"));
     // ... but the merged messages are stored on the thread for auditing.
@@ -193,4 +193,93 @@ async fn pending_messages_recover_after_restart() {
     assert_eq!(mesh.recover().unwrap(), 1);
     let reply = mesh.wait_for("env-crash").await.unwrap();
     assert!(reply.text.contains("survive the crash"));
+}
+
+#[tokio::test]
+async fn system_notes_render_as_stable_system_messages() {
+    let (_d, mesh) = setup(Arc::new(MockProvider::instant()), fast_cfg());
+    mesh.save_persona(&persona("bot")).unwrap();
+    mesh.repo().create_branch("t2", json!({})).unwrap();
+    mesh.ask("bot", "t2", "user", "hi", Value::Null, None).await.unwrap();
+
+    // A note arrives after the assistant reply: it is held until the next user turn.
+    let note = agent::SystemRecord {
+        kind: "operator_note",
+        author: "operator:p1",
+        author_name: Some("Mom"),
+        preamble: Some("Note from Mom (private guidance):"),
+        text: "Sam has a soccer game at 5pm.",
+    };
+    agent::append_system_record(mesh.repo(), "t2", note, vec![]).unwrap();
+    let held = agent::build_context(mesh.repo(), "t2", "bot", "claude-opus-5-5").unwrap();
+    assert_eq!(held.last().unwrap()["role"], "assistant", "note must not follow an assistant turn");
+
+    let reply = mesh.ask("bot", "t2", "user", "what's today?", Value::Null, None).await.unwrap();
+    assert!(reply.text.contains("Keeping in mind"), "{}", reply.text);
+    let ctx = agent::build_context(mesh.repo(), "t2", "bot", "claude-opus-5-5").unwrap();
+    let roles: Vec<&str> = ctx.iter().map(|m| m["role"].as_str().unwrap()).collect();
+    assert_eq!(roles, vec!["user", "assistant", "user", "system", "assistant"]);
+    assert!(ctx[3]["content"].as_str().unwrap().contains("soccer game"));
+    assert!(ctx[3]["content"].as_str().unwrap().contains("Mom"));
+
+    // Append-only: the next request's prefix equals the previous context.
+    mesh.ask("bot", "t2", "user", "ok", Value::Null, None).await.unwrap();
+    let ctx2 = agent::build_context(mesh.repo(), "t2", "bot", "claude-opus-5-5").unwrap();
+    assert_eq!(&ctx2[..ctx.len()], &ctx[..]);
+
+    // Models without mid-conversation system messages get a user-turn note instead.
+    let other = agent::build_context(mesh.repo(), "t2", "bot", "google/gemini-3-flash").unwrap();
+    assert!(other.iter().all(|m| m["role"] != "system"));
+    assert!(serde_json::to_string(&other).unwrap().contains("soccer game"));
+}
+
+#[tokio::test]
+async fn author_framing_is_configurable() {
+    use branchmesh_actors::{AuthorFrame, ContextStyle};
+    let (_d, mesh) = setup(Arc::new(MockProvider::instant()), fast_cfg());
+    mesh.save_persona(&persona("bot")).unwrap();
+    mesh.repo().create_branch("t3", json!({})).unwrap();
+    mesh.set_context_style(
+        ContextStyle::default()
+            .with_author("child:", AuthorFrame::Direct)
+            .with_author("event", AuthorFrame::Labeled("Device event".into())),
+    );
+    mesh.ask("bot", "t3", "child:sam", "hello", Value::Null, None).await.unwrap();
+    let reply = mesh.ask("bot", "t3", "event", "arrived at school", Value::Null, None).await.unwrap();
+    assert!(reply.text.contains("(Device event)"), "{}", reply.text);
+    mesh.ask("bot", "t3", "stranger", "hey", Value::Null, None).await.unwrap();
+    let ctx = agent::build_context_with(mesh.repo(), "t3", "bot", "claude-opus-5-5", &mesh.context_style()).unwrap();
+    let text = serde_json::to_string(&ctx).unwrap();
+    assert!(text.contains("\"hello\""), "{text}");
+    assert!(text.contains("[Device event]\\narrived at school"), "{text}");
+    assert!(text.contains("[message from stranger]"), "{text}");
+}
+
+#[tokio::test]
+async fn standing_facts_snapshot_only_when_changed() {
+    let (_d, mesh) = setup(Arc::new(MockProvider::instant()), fast_cfg());
+    mesh.save_persona(&persona("bot")).unwrap();
+    mesh.repo().create_branch("t2", json!({})).unwrap();
+    let repo = mesh.repo();
+    let snapshots = || {
+        repo.list("t2", "messages").unwrap().into_iter().filter(|(_, m)| m["kind"] == "memory_snapshot").count()
+    };
+    mesh.ask("bot", "t2", "user", "hi", Value::Null, None).await.unwrap();
+    assert_eq!(snapshots(), 0, "no facts, no snapshot");
+
+    repo.commit("t2", &[branchmesh_core::Change::set("memory/facts/allergies", json!({"text": "peanuts"}))],
+        branchmesh_core::repo::CommitOptions::new("parent", "fact")).unwrap();
+    mesh.ask("bot", "t2", "user", "snack ideas?", Value::Null, None).await.unwrap();
+    assert_eq!(snapshots(), 1);
+    mesh.ask("bot", "t2", "user", "thanks", Value::Null, None).await.unwrap();
+    assert_eq!(snapshots(), 1, "unchanged facts are not repeated");
+
+    repo.commit("t2", &[branchmesh_core::Change::set("memory/facts/bedtime", json!({"text": "8pm"}))],
+        branchmesh_core::repo::CommitOptions::new("parent", "fact")).unwrap();
+    mesh.ask("bot", "t2", "user", "when do I sleep?", Value::Null, None).await.unwrap();
+    assert_eq!(snapshots(), 2);
+    let ctx = agent::build_context(repo, "t2", "bot", "claude-opus-5-5").unwrap();
+    let last_sys = ctx.iter().rev().find(|m| m["role"] == "system").unwrap();
+    let text = last_sys["content"].as_str().unwrap();
+    assert!(text.contains("peanuts") && text.contains("8pm"), "{text}");
 }

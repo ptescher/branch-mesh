@@ -45,3 +45,16 @@ pub fn now_ms() -> i64 {
 pub fn new_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }
+
+/// Render an error with its full `source()` chain (e.g. the TLS or DNS cause
+/// behind "error sending request").
+pub fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut cur = e.source();
+    while let Some(s) = cur {
+        out.push_str(": ");
+        out.push_str(&s.to_string());
+        cur = s.source();
+    }
+    out
+}

@@ -1,18 +1,22 @@
-import { api, connectEvents, onEvent, h, clear, debounce, badge } from './lib.js';
+import { api, connectEvents, onEvent, h, clear, debounce, badge, registerEventKinds } from './lib.js';
 import * as topology from './topology.js';
 import * as chat from './chat.js';
 import * as branches from './branches.js';
 import * as journal from './journal.js';
 import * as mailbox from './mailbox.js';
 import * as personas from './personas.js';
+import extensions from './extensions.js';
 
 const views = { topology, chat, branches, journal, mailbox, personas };
+// null = operator session (everything visible); otherwise the allowed view names.
+let allowed = null;
+let home = 'topology';
 let unmount = null;
 
 function parseHash() {
   const raw = location.hash.replace(/^#\/?/, '') || 'topology';
   const [name, query] = raw.split('?');
-  return { name: views[name] ? name : 'topology', params: Object.fromEntries(new URLSearchParams(query || '')) };
+  return { name: views[name] ? name : home, params: Object.fromEntries(new URLSearchParams(query || '')) };
 }
 
 export function navigate(name, params = {}) {
@@ -22,7 +26,8 @@ export function navigate(name, params = {}) {
 window.bmNavigate = navigate;
 
 function route() {
-  const { name, params } = parseHash();
+  let { name, params } = parseHash();
+  if (allowed && !allowed.has(name)) { name = home; history.replaceState(null, '', `#/${home}`); }
   if (unmount) { try { unmount(); } catch (e) { console.error(e); } }
   const container = clear(document.getElementById('view'));
   container.className = `view view-${name}`;
@@ -45,10 +50,42 @@ async function refreshStats() {
   } catch { /* offline */ }
 }
 
-window.addEventListener('hashchange', route);
-connectEvents();
-const statsSoon = debounce(refreshStats, 600);
-onEvent((ev) => { if (ev.kind !== 'llm_delta') statsSoon(); });
-refreshStats();
-setInterval(refreshStats, 15000);
-route();
+async function loadExtensions() {
+  const nav = document.getElementById('nav');
+  let restriction = null;
+  for (const ext of extensions) {
+    Object.assign(views, ext.views || {});
+    for (const { view, label } of ext.nav || []) nav.append(h('a', { href: `#/${view}`, 'data-view': view }, label));
+    for (const href of ext.styles || []) document.head.append(h('link', { rel: 'stylesheet', href }));
+    registerEventKinds(...(ext.eventKinds || []));
+    try {
+      const r = ext.init ? await ext.init() : null;
+      if (r?.views) restriction = r;
+    } catch (e) { console.error('extension init failed', e); }
+  }
+  return restriction;
+}
+
+async function start() {
+  const restriction = await loadExtensions();
+  if (restriction) {
+    allowed = new Set(restriction.views);
+    home = restriction.home || restriction.views[0];
+  }
+  for (const a of document.querySelectorAll('#nav a')) {
+    a.style.display = !allowed || allowed.has(a.dataset.view) ? '' : 'none';
+  }
+  window.addEventListener('hashchange', route);
+  if (!allowed) {
+    connectEvents();
+    const statsSoon = debounce(refreshStats, 600);
+    onEvent((ev) => { if (ev.kind !== 'llm_delta') statsSoon(); });
+    refreshStats();
+    setInterval(refreshStats, 15000);
+  } else {
+    if (restriction.badge) document.getElementById('stats').append(badge(restriction.badge, 'ok'));
+    document.getElementById('conn').style.display = 'none';
+  }
+  route();
+}
+start();

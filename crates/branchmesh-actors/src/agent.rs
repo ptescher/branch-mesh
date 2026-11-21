@@ -5,6 +5,7 @@
 //! journal, so a crashed turn resumes by replaying recorded LLM completions
 //! and tool outputs instead of calling them again.
 
+use crate::context::{AuthorFrame, ContextStyle};
 use crate::llm::{LlmRequest, LlmResponse};
 use crate::mesh::{Envelope, Mesh};
 use crate::persona::AgentPersona;
@@ -35,23 +36,79 @@ fn as_blocks(content: &Value) -> Vec<Value> {
     }
 }
 
+/// Models that accept `role: "system"` entries inside `messages`
+/// (mid-conversation operator instructions).
+pub fn supports_mid_conversation_system(model: &str) -> bool {
+    if model.contains('/') && !model.starts_with("anthropic/") {
+        return false;
+    }
+    let m = crate::anthropic::anthropic_model_id(model);
+    if m == "claude-sonnet-5" || m.starts_with("claude-sonnet-5-2") {
+        return false;
+    }
+    ["claude-opus-5", "claude-opus-4-8", "claude-fable", "claude-mythos", "claude-sonnet-5-5", "claude-haiku-5-5"]
+        .iter()
+        .any(|p| m.starts_with(p))
+}
+
 /// Render the branch's stored messages as an API conversation from the
 /// point of view of `persona`. Deterministic for a given state, so the
 /// prompt prefix stays stable (good for caching and preserved thinking).
-pub fn build_context(repo: &Repo, branch: &str, persona: &str) -> Result<Vec<Value>> {
+///
+/// Stored `role: "system"` records (operator notes, fact snapshots) become
+/// mid-conversation system messages on models that support them. Those must
+/// follow a user turn and precede an assistant turn, so a note written after
+/// an assistant reply is held until the next user turn. Its position never
+/// moves afterwards, keeping the history append-only. Other models get the
+/// note as a user-turn text block instead.
+pub fn build_context(repo: &Repo, branch: &str, persona: &str, model: &str) -> Result<Vec<Value>> {
+    build_context_with(repo, branch, persona, model, &ContextStyle::default())
+}
+
+/// [`build_context`] with application-specific framing rules.
+pub fn build_context_with(repo: &Repo, branch: &str, persona: &str, model: &str, style: &ContextStyle) -> Result<Vec<Value>> {
     let stored = repo.list(branch, "messages")?;
+    let native_system = supports_mid_conversation_system(model);
+    // (role, blocks); role "system" carries a single text block.
     let mut turns: Vec<(String, Vec<Value>)> = Vec::new();
-    let mut push = |role: &str, blocks: Vec<Value>| {
+    let mut pending_system: Vec<String> = Vec::new();
+    let flush = |turns: &mut Vec<(String, Vec<Value>)>, pending: &mut Vec<String>| {
+        if !pending.is_empty() && turns.last().map(|t| t.0 == "user").unwrap_or(false) {
+            let text = std::mem::take(pending).join("\n\n");
+            turns.push(("system".into(), vec![json!({"type": "text", "text": text})]));
+        }
+    };
+    let push = |turns: &mut Vec<(String, Vec<Value>)>, pending: &mut Vec<String>, role: &str, blocks: Vec<Value>| {
         if blocks.is_empty() {
             return;
+        }
+        if role == "assistant" {
+            flush(turns, pending);
         }
         match turns.last_mut() {
             Some((r, b)) if r == role => b.extend(blocks),
             _ => turns.push((role.to_string(), blocks)),
         }
     };
+    macro_rules! push {
+        ($role:expr, $blocks:expr) => {
+            push(&mut turns, &mut pending_system, $role, $blocks)
+        };
+    }
 
     for (_, m) in &stored {
+        if m["role"] == "system" {
+            let text = style.system_text(m, content_text(&m["content"]));
+            if text.trim().is_empty() {
+                continue;
+            }
+            if native_system {
+                pending_system.push(text);
+            } else {
+                push!("user", vec![json!({"type": "text", "text": format!("[{text}]")})]);
+            }
+            continue;
+        }
         // Messages from a consultation this persona started: the outcome is
         // already in its tool_result, so don't show the side conversation.
         if m["consult_of"].as_str() == Some(persona) {
@@ -61,31 +118,33 @@ pub fn build_context(repo: &Repo, branch: &str, persona: &str) -> Result<Vec<Val
         let role = m["role"].as_str().unwrap_or("user");
         let kind = m["kind"].as_str().unwrap_or("message");
         match (role, kind) {
-            ("assistant", _) if own => push("assistant", as_blocks(&m["content"])),
+            ("assistant", _) if own => push!("assistant", as_blocks(&m["content"])),
             ("assistant", _) => {
                 let text = content_text(&m["content"]);
                 if !text.trim().is_empty() {
                     let who = m["persona"].as_str().unwrap_or("another agent");
-                    push("user", vec![json!({"type": "text", "text": format!("[{who} replied]\n{text}")})]);
+                    push!("user", vec![json!({"type": "text", "text": format!("[{who} replied]\n{text}")})]);
                 }
             }
-            (_, "tool_results") if own => push("user", as_blocks(&m["content"])),
+            (_, "tool_results") if own => push!("user", as_blocks(&m["content"])),
             (_, "tool_results") => {}
             _ => {
                 let text = content_text(&m["content"]);
                 let from = m["author"].as_str().unwrap_or("user");
                 let to = m["persona"].as_str();
-                let rendered = if from == "user" && (to.is_none() || to == Some(persona)) {
-                    text
-                } else if from == "user" {
-                    format!("[user → {}]\n{text}", to.unwrap_or("?"))
-                } else {
-                    format!("[message from {from}]\n{text}")
+                let direct = to.is_none() || to == Some(persona);
+                let rendered = match style.frame_for(from) {
+                    Some(AuthorFrame::Direct) if direct => text,
+                    Some(AuthorFrame::Direct) => format!("[user → {}]\n{text}", to.unwrap_or("?")),
+                    Some(AuthorFrame::Labeled(label)) => format!("[{label}]\n{text}"),
+                    None => format!("[message from {from}]\n{text}"),
                 };
-                push("user", vec![json!({"type": "text", "text": rendered})]);
+                push!("user", vec![json!({"type": "text", "text": rendered})]);
             }
         }
     }
+
+    flush(&mut turns, &mut pending_system);
 
     // Repair dangling tool calls (e.g. a turn that was dead-lettered between
     // the model's tool_use and our tool_result) with synthetic error results.
@@ -141,7 +200,69 @@ pub fn build_context(repo: &Repo, branch: &str, persona: &str) -> Result<Vec<Val
     while turns.first().map(|t| t.0 == "assistant").unwrap_or(false) {
         turns.remove(0);
     }
-    Ok(turns.into_iter().map(|(role, content)| json!({"role": role, "content": content})).collect())
+    Ok(turns
+        .into_iter()
+        .map(|(role, content)| {
+            if role == "system" {
+                json!({"role": "system", "content": content[0]["text"]})
+            } else {
+                json!({"role": role, "content": content})
+            }
+        })
+        .collect())
+}
+
+/// Branch path recording which version of the standing facts was last shown.
+pub const FACTS_HASH: &str = "state/facts_hash";
+
+/// Hash and rendering of the standing facts (`<style.facts_prefix>/*`) on a branch.
+pub fn standing_facts(repo: &Repo, branch: &str, style: &ContextStyle) -> Result<(String, String)> {
+    let prefix = style.facts_prefix.trim_end_matches('/');
+    let items = repo.list(branch, prefix)?;
+    let mut lines = Vec::new();
+    for (path, v) in &items {
+        let key = path.trim_start_matches(prefix).trim_start_matches('/');
+        let text = v["text"].as_str().map(String::from).unwrap_or_else(|| v.to_string());
+        lines.push(format!("- {key}: {text}"));
+    }
+    let text = lines.join("\n");
+    Ok((Hash::of(text.as_bytes()).to_hex(), text))
+}
+
+/// A `role: "system"` record for [`append_system_record`].
+#[derive(Debug, Clone, Default)]
+pub struct SystemRecord<'a> {
+    /// Record kind (e.g. `"operator_note"`), shown in UIs.
+    pub kind: &'a str,
+    pub author: &'a str,
+    /// Display name of the author, for UIs.
+    pub author_name: Option<&'a str>,
+    /// Text shown to the model before the content (not shown in transcripts).
+    pub preamble: Option<&'a str>,
+    pub text: &'a str,
+}
+
+/// Append a `role: "system"` record (e.g. an operator note) to a branch's
+/// conversation, together with `extra` changes in the same commit. Rendered
+/// as a mid-conversation system message.
+pub fn append_system_record(repo: &Repo, branch: &str, rec: SystemRecord<'_>, extra: Vec<Change>) -> Result<(String, Hash)> {
+    let SystemRecord { kind, author, author_name, preamble, text } = rec;
+    let ts = branchmesh_core::now_ms();
+    let key = format!("{ts:013}-{}-sys", &branchmesh_core::new_id()[..8]);
+    let mut record = json!({
+        "id": key, "ts": ts, "role": "system", "kind": kind, "author": author,
+        "branch": branch, "content": text,
+    });
+    if let Some(n) = author_name {
+        record["author_name"] = json!(n);
+    }
+    if let Some(p) = preamble {
+        record["preamble"] = json!(p);
+    }
+    let mut changes = vec![Change::set(format!("messages/{key}"), record)];
+    changes.extend(extra);
+    let commit = repo.commit(branch, &changes, CommitOptions::new(author, format!("{kind} from {author}")))?;
+    Ok((key, commit))
 }
 
 struct Turn<'a> {
@@ -153,7 +274,11 @@ struct Turn<'a> {
 }
 
 impl Turn<'_> {
-    fn write_message(&self, label: &str, mut record: Value, message: &str) -> Result<Hash> {
+    fn write_message(&self, label: &str, record: Value, message: &str) -> Result<Hash> {
+        self.write_message_with(label, record, vec![], message)
+    }
+
+    fn write_message_with(&self, label: &str, mut record: Value, extra: Vec<Change>, message: &str) -> Result<Hash> {
         let ts = branchmesh_core::now_ms();
         let short: String = self.durable.id().trim_start_matches("exec-").chars().take(8).collect();
         let key = format!("{ts:013}-{short}-{label}");
@@ -165,9 +290,11 @@ impl Turn<'_> {
             record["consult_of"] = json!(c);
         }
         let author = record["author"].as_str().unwrap_or("system").to_string();
+        let mut changes = vec![Change::set(format!("messages/{key}"), record)];
+        changes.extend(extra);
         self.mesh.repo().commit(
             &self.env.branch,
-            &[Change::set(format!("messages/{key}"), record)],
+            &changes,
             CommitOptions::new(author, message).execution(self.durable.id()),
         )
     }
@@ -257,6 +384,26 @@ async fn run_inner(turn: &Turn<'_>, depth: u32) -> Result<Value> {
         )
         .await?;
 
+    // 2. If the standing facts changed since they were last shown, append a
+    //    snapshot (append-only: the system prompt is never edited).
+    let style = mesh.context_style();
+    let _: Option<Hash> = durable
+        .run(EntryKind::StateWrite, "standing_facts", json!({}), || async {
+            let (hash, text) = standing_facts(repo, &env.branch, &style)?;
+            let shown = repo.get(&env.branch, FACTS_HASH)?;
+            if shown.as_ref().and_then(|v| v.as_str()) == Some(hash.as_str()) || (text.is_empty() && shown.is_none()) {
+                return Ok(None);
+            }
+            let snapshot = if text.is_empty() { style.facts_cleared.clone() } else { format!("{}\n{text}", style.facts_heading) };
+            Ok(Some(turn.write_message_with(
+                "mem",
+                json!({ "role": "system", "kind": "memory_snapshot", "author": "system", "content": snapshot }),
+                vec![Change::set(FACTS_HASH, json!(hash))],
+                "standing facts snapshot",
+            )?))
+        })
+        .await?;
+
     let (tool_defs, tool_map) = resolve_tools(mesh, persona);
     let tool_names: Vec<&String> = tool_map.keys().collect();
     let events = mesh.events().clone();
@@ -272,7 +419,7 @@ async fn run_inner(turn: &Turn<'_>, depth: u32) -> Result<Value> {
     let mut steps = 0u64;
     for step in 0..persona.max_steps.max(1) {
         steps += 1;
-        let messages = build_context(repo, &env.branch, &persona.id)?;
+        let messages = build_context_with(repo, &env.branch, &persona.id, &persona.model, &style)?;
         let context_commit = repo.head(&env.branch)?;
         let req = LlmRequest {
             model: persona.model.clone(),

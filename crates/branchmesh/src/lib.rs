@@ -33,10 +33,11 @@ pub use branchmesh_actors as actors;
 pub use branchmesh_core as core;
 
 pub use branchmesh_actors::{
-    ask_agent_tool, code_interpreter_tool, current_time_tool, http_fetch_tool, memory_read_tool,
+    ask_agent_tool, code_interpreter_tool, AuthorFrame, ContextStyle, current_time_tool, http_fetch_tool, memory_read_tool,
     memory_write_tool, provider_from_env, web_search_tool, ActorInfo, AgentPersona, AnthropicConfig,
     AnthropicProvider, Envelope, EnvelopeStatus, FnTool, LlmConflictResolver, LlmProvider, LlmRequest,
-    LlmResponse, Mesh, MeshConfig, MockProvider, Reply, Tool, ToolContext, ToolRef, DEFAULT_MODEL,
+    LlmResponse, Mesh, MeshConfig, MockProvider, Reply, Speech, Synthesized, Tool, ToolContext, ToolRef, Transcript,
+    VoiceConfig, DEFAULT_MODEL,
 };
 pub use branchmesh_core::repo::CommitOptions;
 pub use branchmesh_core::{
@@ -57,9 +58,16 @@ pub struct RuntimeBuilder {
     config: MeshConfig,
     recover: bool,
     merge_model: Option<String>,
+    speech: Option<Speech>,
 }
 
 impl RuntimeBuilder {
+    /// Use a specific speech stack (default: OpenRouter if `OPENROUTER_API_KEY` is set, else mock).
+    pub fn with_speech(mut self, speech: Speech) -> Self {
+        self.speech = Some(speech);
+        self
+    }
+
     /// Use a specific LLM provider (default: Claude if `ANTHROPIC_API_KEY` is set, else the mock).
     pub fn with_llm(mut self, llm: Arc<dyn LlmProvider>) -> Self {
         self.llm = Some(llm);
@@ -92,7 +100,8 @@ impl RuntimeBuilder {
             .merge_model
             .or_else(|| std::env::var("BRANCHMESH_MERGE_MODEL").ok())
             .unwrap_or_else(|| DEFAULT_MODEL.to_string());
-        let rt = Runtime { inner: Arc::new(RtInner { mesh, path: self.path, merge_model }) };
+        let speech = self.speech.unwrap_or_else(Speech::from_env);
+        let rt = Runtime { inner: Arc::new(RtInner { mesh, path: self.path, merge_model, speech }) };
         if self.recover {
             rt.inner.mesh.recover()?;
         }
@@ -104,6 +113,7 @@ struct RtInner {
     mesh: Mesh,
     path: PathBuf,
     merge_model: String,
+    speech: Speech,
 }
 
 /// The embedded BranchMesh runtime. Cheap to clone.
@@ -125,6 +135,7 @@ impl Runtime {
             config: MeshConfig::default(),
             recover: true,
             merge_model: None,
+            speech: None,
         }
     }
 
@@ -142,6 +153,10 @@ impl Runtime {
 
     pub fn events(&self) -> &EventBus {
         self.inner.mesh.events()
+    }
+
+    pub fn speech(&self) -> &Speech {
+        &self.inner.speech
     }
 
     pub fn register_tool(&self, tool: ToolRef) {

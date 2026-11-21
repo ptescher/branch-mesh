@@ -68,19 +68,31 @@ pub trait LlmProvider: Send + Sync {
     async fn complete(&self, req: &LlmRequest, on_delta: DeltaFn<'_>) -> Result<LlmResponse>;
 }
 
-/// Claude if `ANTHROPIC_API_KEY` (or `ANTHROPIC_AUTH_TOKEN`) is set, otherwise
-/// the offline mock provider. `BRANCHMESH_LLM=mock` forces the mock.
+/// Pick the LLM provider from the environment:
+///
+/// * `BRANCHMESH_LLM=mock|anthropic|openrouter` forces a provider;
+/// * otherwise `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` -> Anthropic directly,
+///   `OPENROUTER_API_KEY` -> OpenRouter, else the offline mock.
 pub fn provider_from_env() -> Arc<dyn LlmProvider> {
-    if std::env::var("BRANCHMESH_LLM").map(|v| v == "mock").unwrap_or(false) {
-        return Arc::new(crate::mock::MockProvider::default());
-    }
-    match crate::anthropic::AnthropicConfig::from_env() {
+    use crate::anthropic::{AnthropicConfig, AnthropicProvider};
+    let forced = std::env::var("BRANCHMESH_LLM").unwrap_or_default().to_ascii_lowercase();
+    let anthropic = || AnthropicConfig::from_env();
+    let openrouter = || AnthropicConfig::openrouter_from_env();
+    let cfg = match forced.as_str() {
+        "mock" => None,
+        "anthropic" => anthropic(),
+        "openrouter" => openrouter(),
+        _ => anthropic().or_else(openrouter),
+    };
+    match cfg {
         Some(cfg) => {
-            tracing::info!(base_url = %cfg.base_url, "using Anthropic provider");
-            Arc::new(crate::anthropic::AnthropicProvider::new(cfg))
+            tracing::info!(flavor = ?cfg.flavor, base_url = %cfg.base_url, "using Messages API provider");
+            Arc::new(AnthropicProvider::new(cfg))
         }
         None => {
-            tracing::warn!("ANTHROPIC_API_KEY not set; using the offline mock LLM provider");
+            if forced != "mock" {
+                tracing::warn!("no ANTHROPIC_API_KEY or OPENROUTER_API_KEY set; using the offline mock LLM provider");
+            }
             Arc::new(crate::mock::MockProvider::default())
         }
     }

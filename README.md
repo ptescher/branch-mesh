@@ -6,6 +6,8 @@ BranchMesh pairs a **durable execution journal** (like Restate or Temporal) with
 
 It ships as one Rust binary with the API and dashboard built in, and runs in Docker with a single volume.
 
+Applications build on it as a library. The server crate can also be embedded, so an application serves the operator API and dashboard next to its own routes and views (see [Embedding the server](#embedding-the-server)).
+
 ```
 ┌──────────────────────── Web UI (embedded) ────────────────────────┐
 │  Mesh Topology · Sessions · Branch Inspector · Journal Replay ·   │
@@ -53,7 +55,9 @@ cargo run -p branchmesh --example quickstart    # the library example below
 cargo test --workspace
 ```
 
-**Without `ANTHROPIC_API_KEY`, BranchMesh uses a deterministic offline mock LLM**, so the whole system (tools, consultations, merges, replay) works with no key. The mock reacts to phrases such as `remember <fact>`, `what do you remember`, `ask <persona> <question>` and `what time is it`.
+**Model access:** set `ANTHROPIC_API_KEY` to call Claude directly, or `OPENROUTER_API_KEY` to go through OpenRouter. With OpenRouter, the same key also powers server-side speech-to-text and text-to-speech.
+
+**Without either key, BranchMesh uses a deterministic offline mock LLM**, so the whole system (tools, consultations, merges, replay) works with no key. The mock reacts to phrases such as `remember <fact>`, `what do you remember`, `ask <persona> <question>` and `what time is it`.
 
 On first start, three demo personas are created (`research-bot`, `fact-checker`, `summarizer`), plus a `threads/welcome` session.
 
@@ -64,7 +68,14 @@ On first start, three demo personas are created (`research-bot`, `fact-checker`,
 | `ANTHROPIC_API_KEY` | — | Claude API key. If neither this nor `ANTHROPIC_AUTH_TOKEN` is set, the mock LLM is used. |
 | `ANTHROPIC_AUTH_TOKEN` | — | Sent as a bearer token instead of an API key. |
 | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | API endpoint override. |
-| `BRANCHMESH_LLM` | — | `mock` forces the offline provider. |
+| `OPENROUTER_API_KEY` | — | Use OpenRouter (its Anthropic-compatible Messages endpoint) for the LLM, and OpenRouter speech-to-text and text-to-speech. Used for the LLM when no Anthropic key is set. |
+| `OPENROUTER_FALLBACK_MODELS` | per model | Comma-separated OpenRouter fallback models (`off` disables). Defaults: Opus 5.5 / Fable → `anthropic/claude-opus-5`, Sonnet 5.5 → `anthropic/claude-sonnet-5`. |
+| `OPENROUTER_APP_NAME` / `OPENROUTER_APP_URL` | `BranchMesh` / — | OpenRouter attribution headers. |
+| `BRANCHMESH_LLM` | — | `mock`, `anthropic` or `openrouter` forces a provider. |
+| `BRANCHMESH_SPEECH` | auto | `mock` forces offline speech. Otherwise OpenRouter is used when `OPENROUTER_API_KEY` is set. |
+| `BRANCHMESH_STT_MODEL` | `elevenlabs/scribe-v2` | Default speech-to-text model. Each persona can override it. |
+| `BRANCHMESH_TTS_MODEL` / `BRANCHMESH_TTS_VOICE` | `elevenlabs/eleven-v4-turbo` / `lily` | Default text-to-speech model and voice. Each persona can override them. |
+| `BRANCHMESH_SPEECH_ZDR` | `false` | Route speech only to zero-data-retention providers. |
 | `BRANCHMESH_DEFAULT_MODEL` | `claude-opus-5-5` | Model for new personas. |
 | `BRANCHMESH_MERGE_MODEL` | `claude-opus-5-5` | Model for semantic (LLM-assisted) merges. |
 | `BRANCHMESH_DATA` | `./data/branchmesh.db` (`/data/branchmesh.db` in Docker) | Database file. |
@@ -177,6 +188,30 @@ Each inbound message becomes one **execution** with a stable id. Every non-deter
 | `web_search` | server | Anthropic `web_search_20260209` |
 | `code_execution` | server | Anthropic `code_execution_20260521`. Not sent alongside `web_search`, which already runs code internally |
 
+## Context rendering
+
+Each branch's stored messages are rendered into a Messages API conversation deterministically, so prompt prefixes stay stable. Applications tune the framing per mesh with `ContextStyle` (`runtime.mesh().set_context_style(...)`):
+
+* **Author framing.** `AuthorFrame::Direct` authors (always `user`) are shown verbatim; `AuthorFrame::Labeled("…")` authors are shown as `[…]\n<text>`; anyone else as `[message from <author>]`.
+* **System records.** `agent::append_system_record` stores a `role: "system"` record (an operator note, for example) on a branch. Models that support it see it as a **mid-conversation system message**; the system prompt is never edited, so caching and thinking replay keep working. A record written after an assistant reply is held until the next user turn and then stays fixed, so history is append-only. Other models get it as a user-turn block. An optional `preamble` is shown to the model only.
+* **Standing facts.** Entries under `memory/facts/<key>` (`{text}`; prefix and heading configurable) are shown as a snapshot whenever they change, appended on the next turn.
+
+## Embedding the server
+
+`branchmesh-server` is also a library:
+
+```rust
+let rt = branchmesh_server::open_runtime(&args).await?;           // ServeArgs: the usual flags/env
+let state = branchmesh_server::AppState::new(rt.clone(), args.api_token.clone())
+    .with_authority(my_token_store);                               // your tokens never reach the operator API
+let app = branchmesh_server::router(state)
+    .merge(my_routes(rt))
+    .fallback(my_assets_then(branchmesh_server::ui::static_handler));
+branchmesh_server::serve(app, args.bind).await?;
+```
+
+The web UI loads `js/extensions.js` (empty by default). Serve your own version of that file to add views, nav entries, stylesheets and SSE event kinds, or to restrict non-operator sessions to your views.
+
 ## Web UI
 
 | View | What it does |
@@ -231,9 +266,18 @@ curl -s localhost:8080/api/branch/send -H 'content-type: application/json' \
   -d '{"branch":"threads/welcome","content":"ask fact-checker to verify: the Eiffel Tower is 330 m tall","wait":true}'
 ```
 
-## Claude integration
+## Model providers
 
-BranchMesh talks to the Messages API over raw HTTP with SSE streaming (there is no official Rust SDK). Each request includes:
+BranchMesh talks to the Anthropic **Messages API** over raw HTTP with SSE streaming (there is no official Rust SDK). The same client works with two backends:
+
+* **Anthropic directly** (`ANTHROPIC_API_KEY`): `api.anthropic.com`, with the model ids used throughout (e.g. `claude-opus-5-5`).
+* **OpenRouter** (`OPENROUTER_API_KEY`): OpenRouter's Anthropic-compatible `POST /api/v1/messages`. Model ids are mapped automatically (`claude-opus-5-5` → `anthropic/claude-opus-5.5`), and personas can name any OpenRouter model (`google/…`, `openai/…`); OpenRouter translates the request. Refusal fallbacks are sent as OpenRouter's `fallbacks: [{model}]` list rather than Anthropic's `"default"` mode. The Claude-specific fields below work there too. Anthropic server tools (`web_search`, `code_execution`) were not tested through OpenRouter.
+
+Speech is a separate pluggable layer (`SpeechToText` / `TextToSpeech`). The included implementation calls OpenRouter's `/api/v1/audio/transcriptions` (base64 JSON) and `/api/v1/audio/speech` (streamed MP3 or PCM). An offline mock is used otherwise.
+
+### Claude request details
+
+Each request includes:
 
 * `thinking: {type: "adaptive"}` on models that support it. Thinking blocks are stored and replayed verbatim, and depth is set per persona with `output_config.effort`.
 * **`thinking.block_binding.prefix_mismatch_behavior: "drop_block"`** (beta `thinking-binding-controls-2026-08-01`). Thinking blocks are bound to the exact conversation prefix that produced them. Forking and merging histories is BranchMesh's whole purpose, and a merge can insert messages into an earlier part of a conversation. With this setting, the API drops the thinking blocks that edit invalidated instead of rejecting the request. Histories that are only appended to are unaffected.
@@ -245,7 +289,7 @@ Semantic merges use structured outputs (`output_config.format` with a JSON schem
 
 ## Security notes
 
-* Set `BRANCHMESH_API_TOKEN` whenever the port is reachable by anyone but you. Without it the API, including the operator state-edit and delete endpoints, is open.
+* Set `BRANCHMESH_API_TOKEN` whenever the port is reachable by anyone but you. Without it the operator API is open. Embedding applications register a `TokenAuthority` so their own tokens get 403 on the operator API even then.
 * `http_fetch` lets the model make outbound GET requests from the server. Disable it (`BRANCHMESH_HTTP_FETCH=off`) or leave it out of persona toolsets if the server can reach internal networks.
 * Message content, memory and tool outputs are stored in plain form in the database file. Protect the `/data` volume accordingly.
 
@@ -254,9 +298,9 @@ Semantic merges use structured outputs (`output_config.format` with a JSON schem
 ```
 crates/
   branchmesh-core/     store.rs (redb) · repo.rs (trees, commits, branches, diff) · merge.rs · journal.rs · events.rs
-  branchmesh-actors/   mesh.rs (actors, mailboxes) · agent.rs (durable loop) · anthropic.rs · mock.rs · tools.rs · resolver.rs
+  branchmesh-actors/   mesh.rs (actors, mailboxes) · agent.rs (durable loop, context rendering) · context.rs (ContextStyle) · anthropic.rs (Anthropic + OpenRouter) · speech.rs · mock.rs · tools.rs · resolver.rs
   branchmesh/          Runtime / Thread facade + examples/quickstart.rs
-  branchmesh-server/   axum API + SSE, embedded UI (ui/, vanilla JS, no build step)
+  branchmesh-server/   lib + `branchmesh` binary: axum API + SSE (api.rs), embedded UI (ui/, vanilla JS, no build step)
 ```
 
 ## Limitations and roadmap

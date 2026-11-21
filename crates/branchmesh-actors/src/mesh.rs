@@ -152,6 +152,7 @@ struct Inner {
     actors: Mutex<HashMap<String, ActorSlot>>,
     stats: Mutex<HashMap<String, ActorStats>>,
     waiters: Mutex<HashMap<String, Vec<Waiter>>>,
+    style: RwLock<crate::context::ContextStyle>,
     config: MeshConfig,
 }
 
@@ -172,6 +173,7 @@ impl Mesh {
                 actors: Mutex::new(HashMap::new()),
                 stats: Mutex::new(HashMap::new()),
                 waiters: Mutex::new(HashMap::new()),
+                style: RwLock::new(Default::default()),
                 config,
             }),
         }
@@ -195,6 +197,15 @@ impl Mesh {
 
     pub fn set_llm(&self, llm: Arc<dyn LlmProvider>) {
         *self.inner.llm.write().unwrap() = llm;
+    }
+
+    /// How stored records are framed for the model (see [`crate::context`]).
+    pub fn context_style(&self) -> crate::context::ContextStyle {
+        self.inner.style.read().unwrap().clone()
+    }
+
+    pub fn set_context_style(&self, style: crate::context::ContextStyle) {
+        *self.inner.style.write().unwrap() = style;
     }
 
     // ------------------------------------------------------------------ tools
@@ -495,6 +506,13 @@ impl Mesh {
                     s.processed += 1;
                     s.last_active = now;
                 }
+                self.events().emit(
+                    "reply",
+                    json!({
+                        "branch": env.branch, "persona": env.to, "envelope": env.id, "execution": env.execution,
+                        "from": env.from, "text": value["text"], "stop_reason": value["stop_reason"], "meta": env.meta,
+                    }),
+                );
                 match self.update_envelope(&env.id, |e| {
                     e.status = EnvelopeStatus::Done;
                     e.result = Some(value);

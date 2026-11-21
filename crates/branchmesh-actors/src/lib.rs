@@ -15,19 +15,23 @@
 
 pub mod agent;
 pub mod anthropic;
+pub mod context;
 pub mod llm;
 pub mod mesh;
 pub mod mock;
 pub mod persona;
 pub mod resolver;
+pub mod speech;
 pub mod tools;
 
-pub use anthropic::{AnthropicConfig, AnthropicProvider};
+pub use anthropic::{AnthropicConfig, AnthropicProvider, Flavor};
+pub use context::{AuthorFrame, ContextStyle};
 pub use llm::{provider_from_env, LlmProvider, LlmRequest, LlmResponse};
 pub use mesh::{ActorInfo, Envelope, EnvelopeStatus, Mesh, MeshConfig, Reply};
 pub use mock::MockProvider;
 pub use persona::AgentPersona;
 pub use resolver::LlmConflictResolver;
+pub use speech::{Speech, SpeechToText, Synthesized, TextToSpeech, Transcript, VoiceConfig};
 pub use tools::{
     ask_agent_tool, code_interpreter_tool, current_time_tool, http_fetch_tool, memory_read_tool,
     memory_write_tool, web_search_tool, FnTool, Tool, ToolContext, ToolRef,

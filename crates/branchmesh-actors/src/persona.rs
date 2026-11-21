@@ -2,7 +2,10 @@ use crate::tools::ToolRef;
 use serde::{Deserialize, Serialize};
 
 fn default_model() -> String {
-    std::env::var("BRANCHMESH_DEFAULT_MODEL").unwrap_or_else(|_| crate::DEFAULT_MODEL.to_string())
+    std::env::var("BRANCHMESH_DEFAULT_MODEL")
+        .ok()
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| crate::DEFAULT_MODEL.to_string())
 }
 fn default_max_tokens() -> u32 {
     16000
@@ -35,6 +38,9 @@ pub struct AgentPersona {
     /// Upper bound on LLM round-trips per inbound message.
     #[serde(default = "default_max_steps")]
     pub max_steps: u32,
+    /// Voice settings for speech clients.
+    #[serde(default)]
+    pub voice: Option<crate::speech::VoiceConfig>,
     #[serde(default)]
     pub created_at: i64,
     #[serde(default)]
@@ -67,6 +73,7 @@ impl AgentPersona {
             effort: None,
             tools: vec![],
             max_steps: default_max_steps(),
+            voice: None,
             created_at: 0,
             updated_at: 0,
             tool_impls: vec![],
@@ -100,6 +107,11 @@ impl AgentPersona {
 
     pub fn with_max_tokens(mut self, n: u32) -> Self {
         self.max_tokens = n;
+        self
+    }
+
+    pub fn with_voice(mut self, voice: crate::speech::VoiceConfig) -> Self {
+        self.voice = Some(voice);
         self
     }
 

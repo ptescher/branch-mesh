@@ -12,14 +12,17 @@ const TOKEN_KEY = 'branchmesh.token';
 export function getToken() { try { return localStorage.getItem(TOKEN_KEY) || ''; } catch { return ''; } }
 function setToken(t) { try { localStorage.setItem(TOKEN_KEY, t); } catch { /* ignore */ } }
 
-export async function api(path, { method = 'GET', body, quiet = false } = {}) {
-  const headers = { 'content-type': 'application/json' };
-  const token = getToken();
+export function setStoredToken(t) { setToken(t); }
+
+export async function api(path, { method = 'GET', body, quiet = false, token: explicit, raw, contentType } = {}) {
+  const headers = { 'content-type': contentType || 'application/json' };
+  const token = explicit ?? getToken();
   if (token) headers.authorization = `Bearer ${token}`;
-  const res = await fetch(`/api${path}`, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
-  if (res.status === 401) {
+  const payload = raw !== undefined ? raw : (body === undefined ? undefined : JSON.stringify(body));
+  const res = await fetch(`/api${path}`, { method, headers, body: payload });
+  if (res.status === 401 && explicit === undefined) {
     const t = prompt('This BranchMesh server requires an API token (BRANCHMESH_API_TOKEN):');
-    if (t) { setToken(t.trim()); return api(path, { method, body, quiet }); }
+    if (t) { setToken(t.trim()); return api(path, { method, body, quiet, raw, contentType }); }
   }
   let data = null;
   const text = await res.text();
@@ -254,3 +257,66 @@ export const STRATEGIES = [
   ['ours', 'Ours (keep target)'],
   ['theirs', 'Theirs (take source)'],
 ];
+
+const sseKinds = new Set(['commit', 'reply', 'llm_delta', 'mailbox_updated', 'mailbox_enqueued', 'execution_started',
+  'execution_finished', 'delta']);
+/** Let UI extensions listen for their own named SSE events in subscribe(). */
+export function registerEventKinds(...kinds) { for (const k of kinds) sseKinds.add(k); }
+
+/** Subscribe to an SSE endpoint; returns a close function. */
+export function subscribe(path, token, handler) {
+  const url = `/api${path}${token ? `${path.includes('?') ? '&' : '?'}token=${encodeURIComponent(token)}` : ''}`;
+  const es = new EventSource(url);
+  for (const k of sseKinds) es.addEventListener(k, (e) => { try { handler(k, JSON.parse(e.data)); } catch (err) { console.error(err); } });
+  return () => es.close();
+}
+
+/** Parse an SSE response body (fetch streaming), calling handler(kind, data). */
+export async function readSse(res, handler) {
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let i;
+    while ((i = buf.indexOf('\n\n')) >= 0) {
+      const block = buf.slice(0, i); buf = buf.slice(i + 2);
+      let kind = 'message'; const data = [];
+      for (const line of block.split('\n')) {
+        if (line.startsWith('event:')) kind = line.slice(6).trim();
+        else if (line.startsWith('data:')) data.push(line.slice(5).trimStart());
+      }
+      if (data.length) { try { handler(kind, JSON.parse(data.join('\n'))); } catch (e) { console.error(e); } }
+    }
+  }
+}
+
+export function b64ToBlob(b64, type) {
+  const bin = atob(b64); const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return new Blob([arr], { type });
+}
+
+/** Sequential audio playback queue. */
+export function audioQueue() {
+  const queue = []; let playing = false;
+  const next = () => {
+    if (playing || !queue.length) return;
+    playing = true;
+    const url = queue.shift();
+    const a = new Audio(url);
+    const done = () => { playing = false; URL.revokeObjectURL(url); next(); };
+    a.onended = done; a.onerror = done;
+    a.play().catch(done);
+  };
+  return { push(blob) { queue.push(URL.createObjectURL(blob)); next(); }, clear() { queue.length = 0; } };
+}
+
+export function metersBetween(a, b) {
+  const R = 6371000, t = Math.PI / 180;
+  const dLat = (b.lat - a.lat) * t, dLon = (b.lon - a.lon) * t;
+  const x = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * t) * Math.cos(b.lat * t) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(x));
+}

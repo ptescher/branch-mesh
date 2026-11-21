@@ -168,7 +168,7 @@ export function mount(root, params) {
       ]);
       if (own) stateEl.append(h('h4', {}, 'What this step changed'), diffList(c.diff));
       stateEl.append(h('h4', {}, `Conversation as of this step (${msgs.length})`),
-        h('div', { class: 'transcript mini' }, msgs.slice(-12).map(renderMessage)));
+        h('div', { class: 'transcript mini' }, msgs.slice(-12).map((m) => renderMessage(m))));
     } catch (err) { stateEl.append(h('div', { class: 'err-text' }, String(err.message))); }
   }
 
