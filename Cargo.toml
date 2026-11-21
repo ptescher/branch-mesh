@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/branchmesh-core",
+    "crates/branchmesh-actors",
+    "crates/branchmesh",
+    "crates/branchmesh-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/ptescher/branch-mesh"
+rust-version = "1.82"
+
+[workspace.dependencies]
+branchmesh-core = { path = "crates/branchmesh-core" }
+branchmesh-actors = { path = "crates/branchmesh-actors" }
+branchmesh = { path = "crates/branchmesh" }
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+futures = "0.3"
+hex = "0.4"
+mime_guess = "2"
+redb = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+rust-embed = "8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

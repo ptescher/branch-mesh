@@ -1,0 +1,27 @@
+[package]
+name = "branchmesh-server"
+description = "BranchMesh HTTP API server with embedded web UI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "branchmesh"
+path = "src/main.rs"
+
+[dependencies]
+branchmesh.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+futures.workspace = true
+mime_guess.workspace = true
+reqwest.workspace = true
+rust-embed.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
