@@ -1,0 +1,21 @@
+[package]
+name = "branchmesh-core"
+description = "Content-addressable DAG store, durable execution journal and 3-way merge engine for BranchMesh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+hex.workspace = true
+redb.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

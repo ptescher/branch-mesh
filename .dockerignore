@@ -1,0 +1,7 @@
+target
+data
+*.db
+.git
+.github
+Dockerfile
+docker-compose.yml

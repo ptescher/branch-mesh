@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BranchMesh</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='8' cy='8' r='5' fill='%2334d399'/><circle cx='24' cy='16' r='5' fill='%23a78bfa'/><circle cx='8' cy='24' r='5' fill='%2360a5fa'/><path d='M8 8 L24 16 L8 24' stroke='%2394a3b8' stroke-width='2' fill='none'/></svg>">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="logo">◆</span> BranchMesh</div>
+    <nav id="nav">
+      <a href="#/topology" data-view="topology">Mesh Topology</a>
+      <a href="#/chat" data-view="chat">Sessions</a>
+      <a href="#/branches" data-view="branches">Branch Inspector</a>
+      <a href="#/journal" data-view="journal">Journal Replay</a>
+      <a href="#/mailbox" data-view="mailbox">Actor Mailbox</a>
+      <a href="#/personas" data-view="personas">Personas</a>
+    </nav>
+    <div class="stats" id="stats"></div>
+    <div class="conn" id="conn" title="Live event stream"><span class="dot"></span><span class="label">offline</span></div>
+  </header>
+  <main id="view"></main>
+  <div id="toasts"></div>
+  <script type="module" src="/js/main.js"></script>
+</body>
+</html>
