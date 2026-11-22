@@ -194,6 +194,7 @@ Each branch's stored messages are rendered into a Messages API conversation dete
 
 * **Author framing.** `AuthorFrame::Direct` authors (always `user`) are shown verbatim; `AuthorFrame::Labeled("…")` authors are shown as `[…]\n<text>`; anyone else as `[message from <author>]`.
 * **System records.** `agent::append_system_record` stores a `role: "system"` record (an operator note, for example) on a branch. Models that support it see it as a **mid-conversation system message**; the system prompt is never edited, so caching and thinking replay keep working. A record written after an assistant reply is held until the next user turn and then stays fixed, so history is append-only. Other models get it as a user-turn block. An optional `preamble` is shown to the model only.
+* **Images.** Messages can carry images (`Mesh::send_with`, or `attachments` over HTTP). The bytes are stored once by content hash beside the object store (`Store::put_media`); branches and the execution journal keep only `{"type": "image", "source": {"type": "media", "hash"}}` blocks, which become base64 image blocks just before the provider call. Only the most recent `ContextStyle::max_images` images (default 8) are shown to the model; older ones become a short note.
 * **Standing facts.** Entries under `memory/facts/<key>` (`{text}`; prefix and heading configurable) are shown as a snapshot whenever they change, appended on the next turn.
 
 ## Embedding the server
@@ -245,7 +246,9 @@ All endpoints are under `/api` and return JSON. Branch names contain `/`, so bra
 | POST | `/branch/fork` | `{source, name}` |
 | POST | `/branch/rollback` | `{name, commit}` |
 | POST | `/branch/abandon` | `{name}` |
-| POST | `/branch/send` | `{branch, content, persona?, from?, wait?}`. Enqueue, or wait for the reply |
+| POST | `/branch/send` | `{branch, content, attachments?, persona?, from?, wait?}`. Enqueue, or wait for the reply. `attachments` are image hashes from `/media` |
+| POST | `/media` | Upload an image as the raw body (JPEG/PNG/GIF/WebP, ≤ 5 MB; type detected from the bytes) → `{hash, media_type, size}` |
+| GET | `/media/{hash}` | The stored image |
 | GET | `/commit/{hash}` | Commit and its diff vs the first parent |
 | GET | `/commit/{hash}/state` | State at a commit |
 | GET | `/diff?from=&to=` | Diff between commits or branch heads |

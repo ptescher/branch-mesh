@@ -36,6 +36,50 @@ fn as_blocks(content: &Value) -> Vec<Value> {
     }
 }
 
+/// Stored content of an inbound message: plain text, or image blocks (by
+/// media reference) followed by the text.
+fn inbound_content(env: &Envelope) -> Value {
+    if env.attachments.is_empty() {
+        return json!(env.content);
+    }
+    let mut blocks: Vec<Value> = env.attachments.iter().map(|a| a.image_block()).collect();
+    if !env.content.trim().is_empty() {
+        blocks.push(json!({"type": "text", "text": env.content}));
+    }
+    Value::Array(blocks)
+}
+
+fn image_blocks(content: &Value) -> Vec<Value> {
+    match content {
+        Value::Array(blocks) => blocks.iter().filter(|b| b["type"] == "image").cloned().collect(),
+        _ => vec![],
+    }
+}
+
+/// Replace stored media references in a conversation with base64 image
+/// blocks for the model. Missing media becomes a short text note.
+pub fn resolve_media(store: &branchmesh_core::Store, messages: &[Value]) -> Result<Vec<Value>> {
+    let mut out = messages.to_vec();
+    for m in out.iter_mut() {
+        let Some(blocks) = m.get_mut("content").and_then(Value::as_array_mut) else { continue };
+        for b in blocks.iter_mut() {
+            if b["type"] != "image" || b["source"]["type"] != "media" {
+                continue;
+            }
+            let hash = b["source"]["hash"].as_str().unwrap_or_default().to_string();
+            let media_type = b["source"]["media_type"].as_str().unwrap_or("image/jpeg").to_string();
+            *b = match store.get_media(&hash).ok().flatten() {
+                Some(bytes) => json!({
+                    "type": "image",
+                    "source": { "type": "base64", "media_type": media_type, "data": crate::speech::base64_encode(&bytes) },
+                }),
+                None => json!({"type": "text", "text": "[an image that is no longer available]"}),
+            };
+        }
+    }
+    Ok(out)
+}
+
 /// Models that accept `role: "system"` entries inside `messages`
 /// (mid-conversation operator instructions).
 pub fn supports_mid_conversation_system(model: &str) -> bool {
@@ -130,6 +174,7 @@ pub fn build_context_with(repo: &Repo, branch: &str, persona: &str, model: &str,
             (_, "tool_results") => {}
             _ => {
                 let text = content_text(&m["content"]);
+                let images = image_blocks(&m["content"]);
                 let from = m["author"].as_str().unwrap_or("user");
                 let to = m["persona"].as_str();
                 let direct = to.is_none() || to == Some(persona);
@@ -139,7 +184,11 @@ pub fn build_context_with(repo: &Repo, branch: &str, persona: &str, model: &str,
                     Some(AuthorFrame::Labeled(label)) => format!("[{label}]\n{text}"),
                     None => format!("[message from {from}]\n{text}"),
                 };
-                push!("user", vec![json!({"type": "text", "text": rendered})]);
+                let mut blocks = images;
+                if !rendered.trim().is_empty() {
+                    blocks.push(json!({"type": "text", "text": rendered.trim_end()}));
+                }
+                push!("user", blocks);
             }
         }
     }
@@ -199,6 +248,18 @@ pub fn build_context_with(repo: &Repo, branch: &str, persona: &str, model: &str,
     // The API requires the conversation to start with a user turn.
     while turns.first().map(|t| t.0 == "assistant").unwrap_or(false) {
         turns.remove(0);
+    }
+    // Only the most recent images are shown; older ones become a note.
+    let mut seen = 0usize;
+    for (_, blocks) in turns.iter_mut().rev() {
+        for b in blocks.iter_mut().rev() {
+            if b["type"] == "image" {
+                seen += 1;
+                if seen > style.max_images {
+                    *b = json!({"type": "text", "text": "[an earlier image, no longer shown]"});
+                }
+            }
+        }
     }
     Ok(turns
         .into_iter()
@@ -376,7 +437,7 @@ async fn run_inner(turn: &Turn<'_>, depth: u32) -> Result<Value> {
                         "kind": "message",
                         "author": env.from,
                         "persona": persona.id,
-                        "content": env.content,
+                        "content": inbound_content(env),
                     }),
                     &format!("message from {}", env.from),
                 )
@@ -445,7 +506,12 @@ async fn run_inner(turn: &Turn<'_>, depth: u32) -> Result<Value> {
                     "last_message": req.messages.last(),
                     "tools": tool_names,
                 }),
-                || async { llm.complete(&req, &on_delta).await },
+                || async {
+                    // Media stays referenced by hash in the journal; the
+                    // provider gets the bytes.
+                    let wire = LlmRequest { messages: resolve_media(repo.store(), &req.messages)?, ..req.clone() };
+                    llm.complete(&wire, &on_delta).await
+                },
             )
             .await?;
         if !replaying {

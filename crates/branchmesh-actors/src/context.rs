@@ -28,6 +28,8 @@ pub struct ContextStyle {
     pub facts_cleared: String,
     /// Branch path prefix holding standing facts (`<prefix>/<key>` -> `{text}`).
     pub facts_prefix: String,
+    /// Most recent images shown to the model; older ones become a short note.
+    pub max_images: usize,
 }
 
 impl Default for ContextStyle {
@@ -37,6 +39,7 @@ impl Default for ContextStyle {
             facts_heading: "Current standing facts (authoritative; they replace any earlier version):".into(),
             facts_cleared: "All previously shared standing facts have been cleared.".into(),
             facts_prefix: FACTS_PREFIX.into(),
+            max_images: 8,
         }
     }
 }

@@ -1,5 +1,6 @@
 use crate::error::{Error, Result};
 use crate::hash::Hash;
+use crate::media::MediaRef;
 use crate::object::Object;
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{de::DeserializeOwned, Serialize};
@@ -8,6 +9,9 @@ use std::sync::Arc;
 
 /// Immutable content-addressed objects: hash bytes -> canonical JSON.
 const OBJECTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("objects");
+/// Raw media bytes (images): hash bytes -> bytes. Metadata lives in the
+/// `media` document namespace.
+const MEDIA: TableDefinition<&[u8], &[u8]> = TableDefinition::new("media");
 /// Mutable documents keyed by "<namespace>/<key>".
 const DOCS: TableDefinition<&str, &[u8]> = TableDefinition::new("docs");
 
@@ -20,6 +24,7 @@ pub mod ns {
     pub const PERSONAS: &str = "personas";
     pub const MERGE_REQUESTS: &str = "merge_requests";
     pub const META: &str = "meta";
+    pub const MEDIA: &str = "media";
 }
 
 /// Embedded storage engine (redb). Cheap to clone.
@@ -45,6 +50,7 @@ impl Store {
         {
             tx.open_table(OBJECTS)?;
             tx.open_table(DOCS)?;
+            tx.open_table(MEDIA)?;
         }
         tx.commit()?;
         Ok(Store { db: Arc::new(db) })
@@ -94,6 +100,40 @@ impl Store {
         let tx = self.db.begin_read()?;
         let table = tx.open_table(OBJECTS)?;
         Ok(table.len()?)
+    }
+
+    // ---------------------------------------------------------------- media
+
+    /// Store media bytes (idempotent) and their metadata. Callers validate
+    /// the bytes first (see [`crate::media::validate_image`]).
+    pub fn put_media(&self, bytes: &[u8], media_type: &str) -> Result<MediaRef> {
+        let hash = Hash::of(bytes);
+        let media = MediaRef { hash: hash.to_hex(), media_type: media_type.into(), size: bytes.len() as u64 };
+        let meta = serde_json::to_vec(&media)?;
+        let tx = self.db.begin_write()?;
+        {
+            let mut table = tx.open_table(MEDIA)?;
+            if table.get(hash.as_bytes())?.is_none() {
+                table.insert(hash.as_bytes(), bytes)?;
+            }
+            let mut docs = tx.open_table(DOCS)?;
+            docs.insert(doc_key(ns::MEDIA, &media.hash).as_str(), meta.as_slice())?;
+        }
+        tx.commit()?;
+        Ok(media)
+    }
+
+    /// Metadata of stored media (`hash` as hex).
+    pub fn media_info(&self, hash: &str) -> Result<Option<MediaRef>> {
+        self.get_doc(ns::MEDIA, hash)
+    }
+
+    /// Bytes of stored media (`hash` as hex).
+    pub fn get_media(&self, hash: &str) -> Result<Option<Vec<u8>>> {
+        let hash = Hash::from_hex(hash)?;
+        let tx = self.db.begin_read()?;
+        let table = tx.open_table(MEDIA)?;
+        Ok(table.get(hash.as_bytes())?.map(|v| v.value().to_vec()))
     }
 
     // ---------------------------------------------------------------- documents
