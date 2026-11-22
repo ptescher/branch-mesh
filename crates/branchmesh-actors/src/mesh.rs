@@ -3,7 +3,7 @@ use crate::llm::{LlmProvider, LlmResponse};
 use crate::persona::AgentPersona;
 use crate::tools::{builtin_tools, ToolContext, ToolRef};
 use branchmesh_core::store::ns;
-use branchmesh_core::{Error, EventBus, Hash, MergeOptions, MergeStrategy, Repo, Result};
+use branchmesh_core::{Error, EventBus, Hash, MediaRef, MergeOptions, MergeStrategy, Repo, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -56,6 +56,9 @@ pub struct Envelope {
     /// `user`, `agent:<persona>` or `system`.
     pub from: String,
     pub content: String,
+    /// Images sent with the message (stored media, see `Store::put_media`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<MediaRef>,
     pub created_at: i64,
     pub updated_at: i64,
     pub status: EnvelopeStatus,
@@ -278,6 +281,22 @@ impl Mesh {
     /// Durably enqueue a message for `(to, branch)` and dispatch it. With an
     /// explicit `id`, sending is idempotent (an existing envelope is reused).
     pub fn send(&self, to: &str, branch: &str, from: &str, content: &str, meta: Value, id: Option<String>) -> Result<Envelope> {
+        self.send_with(to, branch, from, content, vec![], meta, id)
+    }
+
+    /// [`Mesh::send`] with images. Each attachment must already be stored
+    /// (`Store::put_media`); its stored metadata is used.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_with(
+        &self,
+        to: &str,
+        branch: &str,
+        from: &str,
+        content: &str,
+        attachments: Vec<MediaRef>,
+        meta: Value,
+        id: Option<String>,
+    ) -> Result<Envelope> {
         self.persona(to)?;
         self.repo().branch(branch)?;
         let id = id.unwrap_or_else(|| format!("env-{}", branchmesh_core::new_id()));
@@ -287,6 +306,12 @@ impl Mesh {
             }
             return Ok(existing);
         }
+        let attachments = attachments
+            .iter()
+            .map(|a| {
+                self.repo().store().media_info(&a.hash)?.ok_or_else(|| Error::NotFound(format!("media '{}'", a.hash)))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let now = branchmesh_core::now_ms();
         let env = Envelope {
             execution: format!("exec-{}", id.trim_start_matches("env-")),
@@ -295,6 +320,7 @@ impl Mesh {
             branch: branch.into(),
             from: from.into(),
             content: content.into(),
+            attachments,
             created_at: now,
             updated_at: now,
             status: EnvelopeStatus::Pending,
@@ -311,9 +337,24 @@ impl Mesh {
 
     /// Send and wait for the reply.
     pub async fn ask(&self, to: &str, branch: &str, from: &str, content: &str, meta: Value, id: Option<String>) -> Result<Reply> {
+        self.ask_with(to, branch, from, content, vec![], meta, id).await
+    }
+
+    /// [`Mesh::ask`] with images (see [`Mesh::send_with`]).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn ask_with(
+        &self,
+        to: &str,
+        branch: &str,
+        from: &str,
+        content: &str,
+        attachments: Vec<MediaRef>,
+        meta: Value,
+        id: Option<String>,
+    ) -> Result<Reply> {
         let id = id.unwrap_or_else(|| format!("env-{}", branchmesh_core::new_id()));
         let rx = self.register_waiter(&id);
-        let env = self.send(to, branch, from, content, meta, Some(id.clone()))?;
+        let env = self.send_with(to, branch, from, content, attachments, meta, Some(id.clone()))?;
         self.await_reply(&env.id, rx).await
     }
 

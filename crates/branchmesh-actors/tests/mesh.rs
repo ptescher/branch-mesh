@@ -177,6 +177,7 @@ async fn pending_messages_recover_after_restart() {
             branch: "t".into(),
             from: "user".into(),
             content: "survive the crash".into(),
+            attachments: vec![],
             created_at: 1,
             updated_at: 1,
             status: EnvelopeStatus::Processing,
@@ -282,4 +283,46 @@ async fn standing_facts_snapshot_only_when_changed() {
     let last_sys = ctx.iter().rev().find(|m| m["role"] == "system").unwrap();
     let text = last_sys["content"].as_str().unwrap();
     assert!(text.contains("peanuts") && text.contains("8pm"), "{text}");
+}
+
+/// A tiny valid PNG (1x1).
+const PNG: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0x0D, 0x49, 0x48, 0x44, 0x52, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0,
+    0, 0, 0x1F, 0x15, 0xC4, 0x89, 0, 0, 0, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0, 1, 0, 0, 5, 0, 1, 0x0D, 0x0A,
+    0x2D, 0xB4, 0, 0, 0, 0, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+];
+
+#[tokio::test]
+async fn images_are_stored_by_reference_and_sent_to_the_model() {
+    let (_d, mesh) = setup(Arc::new(MockProvider::instant()), fast_cfg());
+    mesh.save_persona(&persona("bot")).unwrap();
+    mesh.repo().create_branch("t", json!({})).unwrap();
+    let store = mesh.repo().store();
+    let media_type = branchmesh_core::media::validate_image(PNG).unwrap();
+    let img = store.put_media(PNG, media_type).unwrap();
+    assert_eq!(store.get_media(&img.hash).unwrap().unwrap(), PNG);
+
+    let reply = mesh.ask_with("bot", "t", "user", "what is this?", vec![img.clone()], Value::Null, None).await.unwrap();
+    assert!(reply.text.contains("I can see 1 image(s): image/png"), "{}", reply.text);
+
+    // The branch keeps a reference, never the bytes.
+    let msgs = mesh.repo().list("t", "messages").unwrap();
+    let inbound = &msgs[0].1;
+    assert_eq!(inbound["content"][0]["source"], json!({"type": "media", "hash": img.hash, "media_type": "image/png"}));
+    assert_eq!(inbound["content"][1]["text"], "what is this?");
+    // So does the journal.
+    let journal = serde_json::to_string(&journal::entries(mesh.repo(), &reply.execution).unwrap()).unwrap();
+    assert!(!journal.contains("\"base64\""), "journal must not hold image bytes");
+
+    // Image-only messages work, and only the newest images are shown.
+    let style = ContextStyle { max_images: 1, ..ContextStyle::default() };
+    mesh.ask_with("bot", "t", "user", "", vec![img.clone()], Value::Null, None).await.unwrap();
+    let ctx = agent::build_context_with(mesh.repo(), "t", "bot", "claude-opus-5-5", &style).unwrap();
+    let images: Vec<&Value> = ctx.iter().flat_map(|m| m["content"].as_array().unwrap().iter()).filter(|b| b["type"] == "image").collect();
+    assert_eq!(images.len(), 1);
+    assert!(serde_json::to_string(&ctx).unwrap().contains("an earlier image, no longer shown"));
+
+    // Unknown media is refused at send time.
+    let bogus = branchmesh_core::MediaRef { hash: "00".repeat(32), media_type: "image/png".into(), size: 1 };
+    assert!(mesh.send_with("bot", "t", "user", "hi", vec![bogus], Value::Null, None).is_err());
 }

@@ -1,11 +1,16 @@
 // Sessions: streaming, event-sourced chat on any branch, with any persona.
-import { api, h, clear, onEvent, debounce, renderMarkdown, jsonView, colorFor, fmtTime, statusOf, toast, select, modal, badge } from './lib.js';
+import { api, h, clear, onEvent, debounce, renderMarkdown, jsonView, colorFor, fmtTime, statusOf, toast, select, modal, badge, mediaImage, imageAttacher } from './lib.js';
 
 export function renderBlocks(blocks) {
   const out = [];
   for (const b of Array.isArray(blocks) ? blocks : [{ type: 'text', text: String(blocks ?? '') }]) {
     switch (b.type) {
       case 'text': out.push(renderMarkdown(b.text)); break;
+      case 'image':
+        out.push(b.source?.type === 'media' ? mediaImage(b.source.hash)
+          : b.source?.type === 'base64' ? h('img', { class: 'media-img', alt: 'image', src: `data:${b.source.media_type};base64,${b.source.data}` })
+            : h('div', { class: 'blk notice' }, '🖼 image'));
+        break;
       case 'thinking':
         out.push(b.thinking
           ? h('details', { class: 'blk thinking' }, h('summary', {}, '💭 reasoning summary'), renderMarkdown(b.thinking))
@@ -138,17 +143,21 @@ export function mount(root, params) {
     statusLine = h('div', { class: 'status-line' });
     const input = h('textarea', { placeholder: 'Message… (Enter to send, Shift+Enter for newline)', rows: 2 });
     input.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
+    const images = imageAttacher({ pasteTarget: input });
     const send = async () => {
       const content = input.value.trim();
-      if (!content) return;
+      const attachments = images.hashes();
+      if (images.busy()) return toast('Still uploading…', 'warn');
+      if (!content && !attachments.length) return;
       input.value = '';
       try {
-        const res = await api('/branch/send', { method: 'POST', body: { branch, persona: personaSel.value, content } });
+        const res = await api('/branch/send', { method: 'POST', body: { branch, persona: personaSel.value, content, attachments } });
+        images.clear();
         waiting.set(res.envelope.execution, { envelope: res.envelope.id, persona: personaSel.value, status: 'queued' });
         renderStatus();
       } catch { input.value = content; }
     };
-    composer = h('div', { class: 'composer' }, input, h('button', { class: 'primary', onclick: send }, 'Send'));
+    composer = h('div', { class: 'composer' }, images.tray, images.button, input, h('button', { class: 'primary', onclick: send }, 'Send'));
     main.append(transcript, statusLine, composer);
     if (statusOf(info) !== 'active') composer.prepend(h('div', { class: 'muted small' }, `This branch is ${statusOf(info)}; messages still work but it will not be merged again automatically.`));
     await loadMessages();

@@ -1,4 +1,5 @@
-use axum::extract::{Path, Query, Request, State};
+use axum::body::Bytes;
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -6,6 +7,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use branchmesh::core::journal;
+use branchmesh::core::media::{self, MediaRef};
 use branchmesh::core::store::ns;
 use branchmesh::{
     AgentPersona, BranchStatus, Change, CommitOptions, EnvelopeStatus, Error, Hash, MergeOptions, MergeStrategy,
@@ -180,6 +182,8 @@ pub fn router(state: AppState) -> Router {
         .route("/mailbox", get(mailbox))
         .route("/mailbox/{id}/retry", post(retry_envelope))
         .route("/topology", get(topology))
+        .route("/media", post(upload_media).layer(DefaultBodyLimit::max(MEDIA_BODY_LIMIT)))
+        .route("/media/{hash}", get(get_media))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth));
 
     Router::new()
@@ -454,12 +458,63 @@ async fn abandon_branch(State(s): State<AppState>, Json(b): Json<NameBody>) -> A
     Ok(Json(json!(info)))
 }
 
+// ------------------------------------------------------------------ media
+
+/// Request body limit for image uploads: the image limit plus slack.
+pub const MEDIA_BODY_LIMIT: usize = media::MAX_IMAGE_BYTES + 64 * 1024;
+
+/// Validate and store an uploaded image (the raw request body). Shared with
+/// applications that expose their own upload routes.
+pub fn store_image(rt: &Runtime, bytes: &[u8]) -> Result<MediaRef, ApiError> {
+    let media_type = media::validate_image(bytes)?;
+    Ok(rt.repo().store().put_media(bytes, media_type)?)
+}
+
+/// Look up stored media by hash (for attaching it to a message).
+pub fn media_ref(rt: &Runtime, hash: &str) -> Result<MediaRef, ApiError> {
+    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(bad(format!("invalid media hash '{hash}'")));
+    }
+    rt.repo()
+        .store()
+        .media_info(hash)?
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, json!({ "error": format!("media '{hash}' not found") })))
+}
+
+/// Serve stored media. Content-addressed, so it can be cached forever.
+pub fn media_response(rt: &Runtime, hash: &str) -> Result<Response, ApiError> {
+    let info = media_ref(rt, hash)?;
+    let bytes = rt.repo().store().get_media(hash)?.ok_or_else(|| ApiError(StatusCode::NOT_FOUND, json!({ "error": "media not found" })))?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, info.media_type),
+            (header::CACHE_CONTROL, "private, max-age=31536000, immutable".into()),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".into()),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+/// `POST /api/media` with the image as the raw body: returns its [`MediaRef`].
+async fn upload_media(State(s): State<AppState>, body: Bytes) -> ApiResult {
+    Ok(Json(json!(store_image(&s.rt, &body)?)))
+}
+
+async fn get_media(State(s): State<AppState>, Path(hash): Path<String>) -> Result<Response, ApiError> {
+    media_response(&s.rt, &hash)
+}
+
 #[derive(Deserialize)]
 struct SendBody {
     branch: String,
     /// Defaults to the branch's persona.
     persona: Option<String>,
+    #[serde(default)]
     content: String,
+    /// Hashes of uploaded images (`POST /api/media`) to send with the message.
+    #[serde(default)]
+    attachments: Vec<String>,
     #[serde(default)]
     from: Option<String>,
     /// Wait for the reply instead of returning the envelope immediately.
@@ -473,16 +528,17 @@ async fn send_message(State(s): State<AppState>, Json(b): Json<SendBody>) -> Api
         .persona
         .or_else(|| branch.meta["persona"].as_str().map(String::from))
         .ok_or_else(|| bad("no persona given and the branch has no default persona"))?;
-    if b.content.trim().is_empty() {
+    let attachments = b.attachments.iter().map(|h| media_ref(&s.rt, h)).collect::<Result<Vec<_>, _>>()?;
+    if b.content.trim().is_empty() && attachments.is_empty() {
         return Err(bad("empty message"));
     }
     let from = b.from.unwrap_or_else(|| "user".into());
     let mesh = s.rt.mesh();
     if b.wait {
-        let reply = mesh.ask(&persona, &b.branch, &from, &b.content, Value::Null, None).await?;
+        let reply = mesh.ask_with(&persona, &b.branch, &from, &b.content, attachments, Value::Null, None).await?;
         Ok(Json(json!({ "reply": reply })))
     } else {
-        let env = mesh.send(&persona, &b.branch, &from, &b.content, Value::Null, None)?;
+        let env = mesh.send_with(&persona, &b.branch, &from, &b.content, attachments, Value::Null, None)?;
         Ok(Json(json!({ "envelope": env })))
     }
 }

@@ -329,3 +329,80 @@ export function metersBetween(a, b) {
   const x = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * t) * Math.cos(b.lat * t) * Math.sin(dLon / 2) ** 2;
   return 2 * R * Math.asin(Math.sqrt(x));
 }
+
+// ------------------------------------------------------------------ images
+
+// Route that serves stored media by hash. Applications whose users are not
+// operators point it at their own (access-checked) route.
+let mediaPath = (hash) => `/media/${hash}`;
+export function setMediaPath(fn) { mediaPath = fn; }
+
+const mediaCache = new Map(); // hash -> Promise<object URL>
+
+/** An <img> for stored media, fetched with the bearer token (never in the URL). */
+export function mediaImage(hash, attrs = {}) {
+  const img = h('img', { class: 'media-img', alt: 'image', ...attrs });
+  let url = mediaCache.get(hash);
+  if (!url) {
+    const token = getToken();
+    url = fetch(`/api${mediaPath(hash)}`, { headers: token ? { authorization: `Bearer ${token}` } : {} })
+      .then((r) => { if (!r.ok) throw new Error(`${r.status}`); return r.blob(); })
+      .then((b) => URL.createObjectURL(b));
+    mediaCache.set(hash, url);
+    url.catch(() => mediaCache.delete(hash));
+  }
+  url.then((u) => { img.src = u; }).catch(() => { img.alt = 'image unavailable'; img.classList.add('missing'); });
+  img.addEventListener('click', () => { if (img.src) window.open(img.src, '_blank'); });
+  return img;
+}
+
+/** Downscale large photos (longest side ≤ maxSide) and re-encode as JPEG. */
+export async function prepareImage(file, maxSide = 1568) {
+  const bmp = await createImageBitmap(file).catch(() => null);
+  if (!bmp) return file; // let the server decide
+  const scale = Math.min(1, maxSide / Math.max(bmp.width, bmp.height));
+  if (scale === 1 && file.size <= 1_500_000 && /^image\/(jpeg|png|gif|webp)$/.test(file.type)) return file;
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.round(bmp.width * scale); canvas.height = Math.round(bmp.height * scale);
+  canvas.getContext('2d').drawImage(bmp, 0, 0, canvas.width, canvas.height);
+  return new Promise((resolve) => canvas.toBlob((b) => resolve(b || file), 'image/jpeg', 0.85));
+}
+
+/** Upload an image file (raw body) to `path`; resolves to its MediaRef. */
+export async function uploadImage(file, path = '/media', opts = {}) {
+  const blob = await prepareImage(file);
+  return api(path, { ...opts, method: 'POST', raw: blob, contentType: blob.type || 'application/octet-stream' });
+}
+
+/**
+ * Attach-images control for a composer: a 📎 button (plus paste into `pasteTarget`)
+ * and a tray of thumbnails. `hashes()` lists what to send; `clear()` after sending.
+ */
+export function imageAttacher({ path = '/media', max = 4, pasteTarget = null, upload = uploadImage } = {}) {
+  const items = []; // { hash, url }
+  let busy = 0;
+  const tray = h('div', { class: 'attach-tray' });
+  const add = async (files) => {
+    for (const f of [...files].filter((x) => x.type.startsWith('image/')).slice(0, Math.max(0, max - items.length))) {
+      busy++; draw();
+      try { const m = await upload(f, path); items.push({ hash: m.hash, url: URL.createObjectURL(f) }); } catch { /* toast shown by api() */ }
+      busy--; draw();
+    }
+  };
+  const input = h('input', { type: 'file', accept: 'image/*', multiple: true, hidden: true, onchange: async (e) => { await add(e.target.files); input.value = ''; } });
+  const button = h('button', { class: 'attach-btn', type: 'button', title: 'Attach images', onclick: () => input.click() }, '📎');
+  pasteTarget?.addEventListener('paste', (e) => { const files = [...(e.clipboardData?.files || [])]; if (files.length) { e.preventDefault(); add(files); } });
+  function draw() {
+    clear(tray).append(...items.map((it, i) => h('span', { class: 'attach-thumb' }, h('img', { src: it.url, alt: 'attached image' }),
+      h('button', { type: 'button', title: 'Remove', onclick: () => { URL.revokeObjectURL(it.url); items.splice(i, 1); draw(); } }, '✕'))),
+    busy ? h('span', { class: 'muted small' }, 'uploading…') : null);
+    tray.hidden = !items.length && !busy;
+  }
+  draw();
+  return {
+    button: h('span', { class: 'attach' }, button, input), tray,
+    hashes: () => items.map((i) => i.hash),
+    busy: () => busy > 0,
+    clear() { for (const i of items) URL.revokeObjectURL(i.url); items.length = 0; draw(); },
+  };
+}

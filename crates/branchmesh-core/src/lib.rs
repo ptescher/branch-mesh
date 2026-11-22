@@ -12,11 +12,13 @@
 //!   non-deterministic side effects (LLM calls, HTTP, tools) after a crash.
 //! * [`merge`] — CouchDB/Dolt-style 3-way JSON merge with pluggable conflict
 //!   resolution (including LLM-assisted semantic resolution).
+//! * [`media`] — images stored by content hash beside the object store.
 
 pub mod error;
 pub mod events;
 pub mod hash;
 pub mod journal;
+pub mod media;
 pub mod merge;
 pub mod object;
 pub mod repo;
@@ -25,6 +27,7 @@ pub mod store;
 pub use error::{Error, Result};
 pub use events::{Event, EventBus};
 pub use hash::Hash;
+pub use media::MediaRef;
 pub use journal::{DurableContext, EntryKind, Execution, ExecutionStatus, JournalEntry};
 pub use merge::{
     Conflict, ConflictResolver, MergeOptions, MergeOutcome, MergePreview, MergeStrategy, Resolution,

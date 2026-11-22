@@ -155,6 +155,15 @@ impl MockProvider {
         } else {
             format!("[mock · {flavor}] I received: \"{line}\". Set an LLM API key to talk to a real model.")
         };
+        // Images that reached the provider as bytes (not still a media reference).
+        let images: Vec<&Value> = last["content"]
+            .as_array()
+            .map(|b| b.iter().filter(|b| b["type"] == "image" && b["source"]["type"] == "base64").collect())
+            .unwrap_or_default();
+        if !images.is_empty() {
+            let types: Vec<&str> = images.iter().filter_map(|b| b["source"]["media_type"].as_str()).collect();
+            text.push_str(&format!(" (I can see {} image(s): {})", images.len(), types.join(", ")));
+        }
         if let Some(note) = note.filter(|n| !n.is_empty()) {
             text.push_str(&format!(" (Keeping in mind: {note})"));
         }
